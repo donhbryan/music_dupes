@@ -1,5 +1,22 @@
 MUSIC LIBRARY MANAGEMENT
 
+I have added a Time-Aware Syncing mechanism. By tracking the mtime (last modified time) of files, the script can now skip over thousands of files in milliseconds, only calculating fingerprints and querying the API for brand-new or recently edited tracks.
+
+This turns the script from a "one-time fix" into a permanent library daemon that you can run daily.
+
+Finalized Music Manager with Incremental Sync & Indexing
+
+How to use the Conflict Resolver
+Above 98%: The script automatically keeps the better file (e.g., it will always pick the FLAC over the MP3 without asking).
+
+95% to 98%: The script will pause and print a comparison table.
+
+Press 1 if the new file is the one you want.
+
+Press 2 if the one already in the library is better.
+
+Press S if they are actually different songs (e.g., a "Radio Edit" vs. "Extended Mix" that are very similar) to keep both.
+
 Different FPCALC fingerprints for the same audio stored in different formats (FLAC vs MP3).
 
 Generally, yes, but not always bit-for-bit identical.
