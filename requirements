@@ -1,0 +1,4 @@
+mutagen
+acoustid
+tqdm
+#System Binary: You must have the Chromaprint (fpcalc) binary installed and accessible in your system PATH (required by the acoustid library).

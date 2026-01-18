@@ -9,6 +9,7 @@ bin/
 .idea/
 .vscode/
 *.log
+*.db
 .env
 
 *wav
@@ -24,7 +25,6 @@ bin/
 *.ds_store
 Thumbs.db
 *.sqlite
-*.db
 *.bak
 *.tmp
 *.swp   
