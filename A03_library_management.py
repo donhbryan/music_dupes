@@ -66,7 +66,7 @@ def sanitize_filename(text: str) -> str:
     # # Replace fancy quotes with standard ones
     # text = text.replace("“", '"').replace("”", '"')
     # text = text.replace("‘", "'").replace("’", "'")
- 
+
     # Remove invalid fs chars and trim whitespace
     clean = re.sub(r'[\\/*?:"<>|]', "", str(text)).strip()
     return clean[:100]  # Limit length to avoid OS errors
@@ -122,8 +122,6 @@ class DatabaseHandler:
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_block ON fingerprint_index(block)"
             )
-            self.prune_database()
-            
 
     def get_blocks(self, fingerprint: str) -> List[str]:
         """Splits fingerprint into chunks for indexing."""
@@ -183,41 +181,6 @@ class DatabaseHandler:
     def delete_index(self, path: str):
         with self.conn:
             self.conn.execute("DELETE FROM fingerprint_index WHERE path = ?", (path,))
-
-    # --- NEW: Database Pruning Utility ---
-    def prune_database(self):
-        """Checks DB entries against filesystem and removes non-existent files."""
-        if not self.config.MUSIC_FOLDER.exists():
-            logging.error(
-                f"Music folder {self.config.MUSIC_FOLDER} not found. Aborting prune to prevent DB wipe."
-            )
-            print("(!) Music folder not found. Skipping prune safety check.")
-            return
-
-        print("Checking for ghost entries in database...")
-        removed_count = 0
-
-        with sqlite3.connect(self.config.DB_PATH) as conn:
-            # Get all paths currently in the DB
-            cursor = conn.execute("SELECT path FROM files")
-            all_paths = cursor.fetchall()
-
-            for (path_str,) in tqdm(all_paths, desc="Pruning DB"):
-                if not Path(path_str).exists():
-                    # File is missing, delete from both tables
-                    conn.execute("DELETE FROM files WHERE path = ?", (path_str,))
-                    conn.execute(
-                        "DELETE FROM fingerprint_index WHERE path = ?", (path_str,)
-                    )
-                    removed_count += 1
-
-            conn.commit()
-
-        if removed_count > 0:
-            logging.info(f"Pruned {removed_count} ghost entries from database.")
-            print(f"cleaned up {removed_count} missing files from the database.")
-        else:
-            print("Database is clean.")
 
     def close(self):
         self.conn.close()
@@ -325,6 +288,7 @@ class LibraryManager:
     def __init__(self, config: Config):
         self.cfg = config
         self.cfg.validate()
+        self.prune_database()
 
         logging.basicConfig(
             filename=self.cfg.LOG_FILE,
@@ -334,6 +298,42 @@ class LibraryManager:
 
         self.db = DatabaseHandler(self.cfg.DB_PATH, self.cfg.BLOCK_SIZE)
         self.audio = AudioProcessor(self.cfg.API_KEY)
+
+    # --- NEW: Database Pruning Utility ---
+    def prune_database(self):
+        """Checks DB entries against filesystem and removes non-existent files."""
+        if not self.cfg.MUSIC_FOLDER.exists():
+            logging.error(
+                "Music folder %s not found. Aborting prune to prevent DB wipe.",
+                self.cfg.MUSIC_FOLDER,
+            )
+            print("(!) Music folder not found. Skipping prune safety check.")
+            return
+
+        print("Checking for ghost entries in database...")
+        removed_count = 0
+
+        with sqlite3.connect(self.cfg.DB_PATH) as conn:
+            # Get all paths currently in the DB
+            cursor = conn.execute("SELECT path FROM files")
+            all_paths = cursor.fetchall()
+
+            for (path_str,) in tqdm(all_paths, desc="Pruning DB"):
+                if not Path(path_str).exists():
+                    # File is missing, delete from both tables
+                    conn.execute("DELETE FROM files WHERE path = ?", (path_str,))
+                    conn.execute(
+                        "DELETE FROM fingerprint_index WHERE path = ?", (path_str,)
+                    )
+                    removed_count += 1
+
+            conn.commit()
+
+        if removed_count > 0:
+            logging.info("Pruned %d ghost entries from database.", removed_count)
+            print(f"cleaned up {removed_count} missing files from the database.")
+        else:
+            print("Database is clean.")
 
     def scan_files(self) -> Generator[Path, None, None]:
         """Yields valid audio files from the music directory."""
@@ -560,7 +560,9 @@ if __name__ == "__main__":
         DUP_FOLDER=Path("/mnt/ssk/duplicates/"),
         DRY_RUN=False,
     )
-    print(f"starting with music folder: {config.MUSIC_FOLDER} and dup folder: {config.DUP_FOLDER}")
+    print(
+        f"starting with music folder: {config.MUSIC_FOLDER} and dup folder: {config.DUP_FOLDER}"
+    )
     manager = LibraryManager(config)
     manager.process_library()
     print("Library Sync Complete.")
