@@ -96,8 +96,16 @@ class DatabaseHandler:
     def _init_schema(self):
         with self.conn:
             self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS files (
+                """CREATE TABLE IF NOT EXISTS albums (
+                    release_id TEXT PRIMARY KEY,
+                    album_title TEXT,
+                    album_artist TEXT,
+                    release_date TEXT,
+                    country TEXT
+                )"""
+            )
+            self.conn.execute(
+                """CREATE TABLE IF NOT EXISTS files (
                     path TEXT PRIMARY KEY,
                     fingerprint TEXT,
                     score INTEGER,
