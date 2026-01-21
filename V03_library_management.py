@@ -2,7 +2,6 @@ import os
 import shutil
 import sqlite3
 import logging
-import csv
 import difflib
 import re
 import time
@@ -12,25 +11,29 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple, List, Generator
 
 # Third-party imports
-from tqdm import tqdm
-import acoustid
-import mutagen
-from mutagen.asf import ASF
+try:
+    from tqdm import tqdm
+    import acoustid
+    import mutagen
+    from mutagen.asf import ASF
+except ImportError as e:
+    print(f"Missing dependency: {e}")
+    print("Please install: pip install tqdm pyacoustid mutagen")
+    sys.exit(1)
 
 
 # --- Configuration ---
 @dataclass
 class Config:
-    API_KEY: str = "7dlZplmc3N"
+    API_KEY: str = "7dlZplmc3N"  # Replace with your actual AcoustID API Key
     MUSIC_FOLDER: Path = Path("./data/music")
     DUP_FOLDER: Path = Path("./data/dups")
     DB_PATH: str = "library_manager.db"
-    EXPORT_PATH: str = "music_library_report.csv"
     LOG_FILE: str = "library_manager.log"
     DRY_RUN: bool = False
 
     # Tuning
-    SLEEP_TIME: float = 0.1  # Increased slightly to be nice to API
+    SLEEP_TIME: float = 0.2  # Time to sleep between API calls
     SIMILARITY_AUTO: float = 0.98
     SIMILARITY_ASK: float = 0.95
     BLOCK_SIZE: int = 16
@@ -63,11 +66,6 @@ def sanitize_filename(text: str) -> str:
     """Removes illegal characters from filenames."""
     if not text:
         return "Unknown"
-    # # Replace fancy quotes with standard ones
-    # text = text.replace("“", '"').replace("”", '"')
-    # text = text.replace("‘", "'").replace("’", "'")
-
-    # Remove invalid fs chars and trim whitespace
     clean = re.sub(r'[\\/*?:"<>|]', "", str(text)).strip()
     return clean[:100]  # Limit length to avoid OS errors
 
@@ -101,23 +99,32 @@ class DatabaseHandler:
                     album_title TEXT,
                     album_artist TEXT,
                     release_date TEXT,
-                    country TEXT
+                    country TEXT,
+                    is_explicit INTEGER DEFAULT 0
                 )"""
             )
+
+            # Updated schema to include all fields used in upsert_file
             self.conn.execute(
                 """CREATE TABLE IF NOT EXISTS files (
                     path TEXT PRIMARY KEY,
                     fingerprint TEXT,
-                    score INTEGER,
+                    title TEXT,
+                    track_no INTEGER,
+                    disc_no INTEGER,
                     format TEXT,
+                    file_size INTEGER,
+                    quality_score REAL,
                     bitrate INTEGER,
                     sample_rate INTEGER,
-                    file_size INTEGER,
                     last_mod REAL,
-                    is_duplicate INTEGER DEFAULT 0
-                )
-            """
+                    album_id TEXT,
+                    processed INTEGER DEFAULT 0,
+                    is_duplicate INTEGER DEFAULT 0,
+                    FOREIGN KEY (album_id) REFERENCES albums (release_id)
+                )"""
             )
+
             self.conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS fingerprint_index (
@@ -141,6 +148,8 @@ class DatabaseHandler:
     def find_potential_matches(self, fingerprint: str) -> List[str]:
         """Finds paths that share at least one fingerprint block."""
         blocks = self.get_blocks(fingerprint)
+        if not blocks:
+            return []
         placeholders = ",".join(["?"] * len(blocks))
         query = f"SELECT DISTINCT path FROM fingerprint_index WHERE block IN ({placeholders})"
         cursor = self.conn.execute(query, blocks)
@@ -148,7 +157,7 @@ class DatabaseHandler:
 
     def get_file_record(self, path: str) -> Optional[Tuple]:
         cursor = self.conn.execute(
-            "SELECT score, format, bitrate, file_size, fingerprint FROM files WHERE path = ?",
+            "SELECT quality_score, format, bitrate, file_size, fingerprint FROM files WHERE path = ?",
             (path,),
         )
         return cursor.fetchone()
@@ -162,7 +171,7 @@ class DatabaseHandler:
             self.conn.execute(
                 """
                 INSERT OR REPLACE INTO files 
-                (path, fingerprint, score, format, bitrate, sample_rate, file_size, last_mod, is_duplicate) 
+                (path, fingerprint, quality_score, format, bitrate, sample_rate, file_size, last_mod, is_duplicate) 
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
@@ -296,7 +305,6 @@ class LibraryManager:
     def __init__(self, config: Config):
         self.cfg = config
         self.cfg.validate()
-        self.prune_database()
 
         logging.basicConfig(
             filename=self.cfg.LOG_FILE,
@@ -307,7 +315,9 @@ class LibraryManager:
         self.db = DatabaseHandler(self.cfg.DB_PATH, self.cfg.BLOCK_SIZE)
         self.audio = AudioProcessor(self.cfg.API_KEY)
 
-    # --- NEW: Database Pruning Utility ---
+        # Pruning MUST happen after DB init
+        self.prune_database()
+
     def prune_database(self):
         """Checks DB entries against filesystem and removes non-existent files."""
         if not self.cfg.MUSIC_FOLDER.exists():
@@ -321,21 +331,21 @@ class LibraryManager:
         print("Checking for ghost entries in database...")
         removed_count = 0
 
-        with sqlite3.connect(self.cfg.DB_PATH) as conn:
-            # Get all paths currently in the DB
-            cursor = conn.execute("SELECT path FROM files")
+        # Use the existing database connection from DatabaseHandler
+        with self.db.conn:
+            cursor = self.db.conn.execute("SELECT path FROM files")
             all_paths = cursor.fetchall()
 
             for (path_str,) in tqdm(all_paths, desc="Pruning DB"):
                 if not Path(path_str).exists():
                     # File is missing, delete from both tables
-                    conn.execute("DELETE FROM files WHERE path = ?", (path_str,))
-                    conn.execute(
+                    self.db.conn.execute(
+                        "DELETE FROM files WHERE path = ?", (path_str,)
+                    )
+                    self.db.conn.execute(
                         "DELETE FROM fingerprint_index WHERE path = ?", (path_str,)
                     )
                     removed_count += 1
-
-            conn.commit()
 
         if removed_count > 0:
             logging.info("Pruned %d ghost entries from database.", removed_count)
@@ -408,7 +418,7 @@ class LibraryManager:
             # Get full stats for the candidate
             row = self.db.get_file_record(path)
             if not row:
-                continue  # Should not happen due to FK, but safety first
+                continue
 
             cached_score, c_fmt, c_bit, c_size, c_fp = row
 
@@ -564,12 +574,12 @@ class LibraryManager:
 if __name__ == "__main__":
     # Example usage
     config = Config(
-        MUSIC_FOLDER=Path("/mnt/ssk/music/"),
-        DUP_FOLDER=Path("/mnt/ssk/duplicates/"),
+        MUSIC_FOLDER=Path("/mnt/ssk/music"),
+        DUP_FOLDER=Path("/mnt/ssk/duplicates"),
         DRY_RUN=False,
     )
     print(
-        f"starting with music folder: {config.MUSIC_FOLDER} and dup folder: {config.DUP_FOLDER}"
+        f"Starting with music folder: {config.MUSIC_FOLDER} and dup folder: {config.DUP_FOLDER}"
     )
     manager = LibraryManager(config)
     manager.process_library()
