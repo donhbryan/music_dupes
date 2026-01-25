@@ -181,6 +181,10 @@ class MusicLibraryManager:
 
             cand_fp, cand_q, cand_fmt, cand_size = res
 
+            # --- FIX: Handle NULL scores in DB ---
+            if cand_q is None:
+                cand_q = 0.0
+
             # Calculate similarity
             ratio = difflib.SequenceMatcher(None, fingerprint, cand_fp).ratio()
 
@@ -242,6 +246,8 @@ class MusicLibraryManager:
 
         for result in results:
             match_score = result.get("score", 0)
+            if match_score is None:
+                match_score = 0
 
             # Fix: safely handle cases where 'recordings' is explicit null
             recordings = result.get("recordings") or []
@@ -406,6 +412,7 @@ class MusicLibraryManager:
                 if current_page > 0:
                     prompt_options.append("(P)rev")
                 prompt_options.append("(0) Skip")
+                prompt_options.append("(Q)uit")
 
                 prompt_str = f"Select Album # (1-{len(candidates)}), " + ", ".join(
                     prompt_options
@@ -415,6 +422,8 @@ class MusicLibraryManager:
 
                 if choice == "0":
                     return None
+                elif choice == "q":
+                    return "quit"
                 elif choice == "n" and current_page < total_pages - 1:
                     current_page += 1
                 elif choice == "p" and current_page > 0:
@@ -560,9 +569,16 @@ class MusicLibraryManager:
                 self._safe_move(path, self.dup_folder)
 
             # Mark processed but don't add to main index
+            # FIX: Insert available quality metadata to avoid NULLs
             self.cur.execute(
-                "INSERT OR REPLACE INTO files (path, processed, fingerprint) VALUES (?, 1, ?)",
-                (path, fingerprint),
+                "INSERT OR REPLACE INTO files (path, processed, fingerprint, quality_score, format, file_size) VALUES (?, 1, ?, ?, ?, ?)",
+                (
+                    path,
+                    fingerprint,
+                    quality["score"],
+                    quality["format"],
+                    quality["size"],
+                ),
             )
             self.conn.commit()
             return False
@@ -586,6 +602,10 @@ class MusicLibraryManager:
             return True  # No conflict, proceed
 
         existing_path, existing_score = existing
+
+        # --- FIX: Handle NULL scores in DB ---
+        if existing_score is None:
+            existing_score = 0.0
 
         # Logic: Compare Quality Score
         if quality["score"] > existing_score:
@@ -619,9 +639,16 @@ class MusicLibraryManager:
                 self._safe_move(path, self.dup_folder)
 
             # Mark processed in DB so we don't scan it again, but don't index it
+            # FIX: Insert available quality metadata to avoid NULLs
             self.cur.execute(
-                "INSERT OR REPLACE INTO files (path, processed, acoustid_id) VALUES (?, 1, ?)",
-                (path, acoustid_id),
+                "INSERT OR REPLACE INTO files (path, processed, acoustid_id, quality_score, format, file_size) VALUES (?, 1, ?, ?, ?, ?)",
+                (
+                    path,
+                    acoustid_id,
+                    quality["score"],
+                    quality["format"],
+                    quality["size"],
+                ),
             )
             self.conn.commit()
             return False
@@ -746,6 +773,10 @@ class MusicLibraryManager:
                     selected_match = top_match
                 else:
                     selected_match = self._prompt_user_selection(path, candidates)
+                    if selected_match == "quit":
+                        logging.info("User initiated quit.")
+                        self.close()
+                        sys.exit(0)
 
                 if not selected_match:
                     logging.info(f"Skipped by user: {path}")
