@@ -8,6 +8,7 @@ import shutil
 import acoustid
 import difflib
 import mutagen
+import traceback
 from mutagen.id3 import ID3, TPE1, TPE2, TRCK, TPOS, TIT2, TALB
 from tqdm import tqdm
 
@@ -59,7 +60,6 @@ class MusicLibraryManager:
         """Creates the normalized database schema."""
         self.cur.execute("PRAGMA foreign_keys = ON")
 
-        # 1. Albums Metadata
         self.cur.execute(
             """CREATE TABLE IF NOT EXISTS albums (
                             release_id TEXT PRIMARY KEY,
@@ -70,7 +70,6 @@ class MusicLibraryManager:
                         )"""
         )
 
-        # 2. Active Files
         self.cur.execute(
             """CREATE TABLE IF NOT EXISTS files (
                             path TEXT PRIMARY KEY,
@@ -91,8 +90,7 @@ class MusicLibraryManager:
             "CREATE INDEX IF NOT EXISTS idx_acoustid ON files(acoustid_id)"
         )
 
-        # 3. Fingerprint History (Source of Truth for IDs)
-        # Stores ALL fingerprints seen for an ID, even if file is deleted.
+        # Fingerprint History
         self.cur.execute(
             """CREATE TABLE IF NOT EXISTS known_fingerprints (
                             fingerprint TEXT,
@@ -101,8 +99,7 @@ class MusicLibraryManager:
                         )"""
         )
 
-        # 4. Fingerprint Blocks (Index for Fast Lookup)
-        # Maps sub-blocks of fingerprints to AcoustIDs
+        # Fingerprint Blocks
         self.cur.execute(
             """CREATE TABLE IF NOT EXISTS known_blocks (
                             block TEXT,
@@ -112,6 +109,19 @@ class MusicLibraryManager:
         self.cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_known_blocks ON known_blocks(block)"
         )
+
+        # Fingerprint Index (File Path based - for local dedup)
+        self.cur.execute(
+            """CREATE TABLE IF NOT EXISTS fingerprint_index (
+                            block TEXT,
+                            path TEXT,
+                            FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE
+                        )"""
+        )
+        self.cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_blocks ON fingerprint_index(block)"
+        )
+
         self.conn.commit()
 
     def prune_database(self):
@@ -130,6 +140,9 @@ class MusicLibraryManager:
             for (path_str,) in tqdm(all_paths, desc="Pruning DB"):
                 if not os.path.exists(path_str):
                     self.conn.execute("DELETE FROM files WHERE path = ?", (path_str,))
+                    self.conn.execute(
+                        "DELETE FROM fingerprint_index WHERE path = ?", (path_str,)
+                    )
                     removed_count += 1
 
         if removed_count > 0:
@@ -147,38 +160,109 @@ class MusicLibraryManager:
         ][:16]
 
     def _update_fingerprint_cache(self, acoustid_id, fingerprint):
-        """
-        Saves the Fingerprint->ID association to history.
-        This allows future files to match locally even if the original file is deleted.
-        """
+        """Saves the Fingerprint->ID association to history."""
         try:
-            # 1. Insert into history
             self.cur.execute(
                 "INSERT OR IGNORE INTO known_fingerprints (fingerprint, acoustid_id) VALUES (?, ?)",
                 (fingerprint, acoustid_id),
             )
 
-            # 2. Index blocks (Delete old blocks for this specific fingerprint first to avoid dupes)
-            # Since fingerprint is part of PK in known_fingerprints, we just add blocks blindly
-            # or check if they exist. For speed, we just try insert.
-
-            # Check if we already indexed this fingerprint (optimization)
-            # This check prevents exploding the block table size on re-runs
+            # Optimization: check existence before bulk insert
             self.cur.execute(
-                "SELECT 1 FROM known_fingerprints WHERE fingerprint = ?", (fingerprint,)
+                "SELECT 1 FROM known_blocks WHERE acoustid_id = ? LIMIT 1",
+                (acoustid_id,),
             )
-            if self.cur.fetchone():
-                # We assume blocks are there if fingerprint is there.
-                # If you want to be safe, you can skip this check.
-                pass
-
-            blocks = [(b, acoustid_id) for b in self._get_blocks(fingerprint)]
-            self.cur.executemany(
-                "INSERT INTO known_blocks (block, acoustid_id) VALUES (?, ?)", blocks
-            )
+            if not self.cur.fetchone():
+                blocks = [(b, acoustid_id) for b in self._get_blocks(fingerprint)]
+                self.cur.executemany(
+                    "INSERT INTO known_blocks (block, acoustid_id) VALUES (?, ?)",
+                    blocks,
+                )
             self.conn.commit()
         except sqlite3.Error as e:
             logging.error(f"Failed to update fingerprint cache: {e}")
+
+    def _update_index(self, path, fingerprint):
+        """Updates the blocking index for a new file."""
+        self.cur.execute("DELETE FROM fingerprint_index WHERE path = ?", (path,))
+        blocks = [(b, path) for b in self._get_blocks(fingerprint)]
+        self.cur.executemany(
+            "INSERT INTO fingerprint_index (block, path) VALUES (?, ?)", blocks
+        )
+
+    def _display_local_matches(self, acoustid_id):
+        """Displays existing albums in the library that contain this song."""
+        try:
+            query = """
+                SELECT DISTINCT a.album_title, a.album_artist
+                FROM files f
+                JOIN albums a ON f.album_id = a.release_id
+                WHERE f.acoustid_id = ? AND f.processed = 1
+            """
+            self.cur.execute(query, (acoustid_id,))
+            rows = self.cur.fetchall()
+            if rows:
+                print(f"\n[INFO] You already have this song in your library:")
+                for title, artist in rows:
+                    print(f"   * {title} ({artist})")
+                print("-" * 80)
+        except sqlite3.Error as e:
+            logging.error(f"Failed to fetch local matches: {e}")
+
+    def _get_owned_release_ids(self, acoustid_id):
+        """Returns a set of release IDs for this AcoustID that are already in the library."""
+        try:
+            query = "SELECT DISTINCT album_id FROM files WHERE acoustid_id = ? AND processed = 1"
+            self.cur.execute(query, (acoustid_id,))
+            return set(row[0] for row in self.cur.fetchall())
+        except sqlite3.Error as e:
+            logging.error(f"Failed to fetch local matches: {e}")
+            return set()
+
+    def _find_local_fuzzy_match(self, fingerprint):
+        """
+        Uses blocking strategy to find candidates, then difflib for fuzzy matching.
+        Returns: (best_match_path, match_score, match_record)
+        """
+        blocks = self._get_blocks(fingerprint)
+        if not blocks:
+            return None, 0.0, None
+
+        # 1. Block Search: Find files sharing fingerprint blocks
+        placeholders = ",".join(["?"] * len(blocks))
+        query = f"SELECT DISTINCT path FROM fingerprint_index WHERE block IN ({placeholders})"
+        self.cur.execute(query, blocks)
+        candidates = [row[0] for row in self.cur.fetchall()]
+
+        best_path = None
+        best_score = 0.0
+        best_record = None
+
+        # 2. Fuzzy Matching: Detailed comparison
+        for cand_path in candidates:
+            self.cur.execute(
+                "SELECT fingerprint, quality_score, format, file_size FROM files WHERE path = ?",
+                (cand_path,),
+            )
+            res = self.cur.fetchone()
+            if not res:
+                continue
+
+            cand_fp, cand_q, cand_fmt, cand_size = res
+
+            # Handle NULL scores in DB
+            if cand_q is None:
+                cand_q = 0.0
+
+            # Calculate similarity
+            ratio = difflib.SequenceMatcher(None, fingerprint, cand_fp).ratio()
+
+            if ratio > best_score:
+                best_score = ratio
+                best_path = cand_path
+                best_record = {"score": cand_q, "format": cand_fmt, "size": cand_size}
+
+        return best_path, best_score, best_record
 
     def _identify_locally(self, fingerprint):
         """
@@ -396,16 +480,21 @@ class MusicLibraryManager:
 
                 print(f"\n[!] Ambiguous API Match for file: {filename}")
                 print(f"    Page {current_page + 1}/{total_pages}")
+                # Added 'Own' column header
                 print(
-                    f"{'#':<3} {'Sim':<5} {'Ctry':<4} {'Date':<6} {'Artist':<20} {'Album'}"
+                    f"{'#':<3} {'Own':<3} {'Sim':<5} {'Ctry':<4} {'Date':<6} {'Artist':<20} {'Album'}"
                 )
                 print("-" * 80)
 
                 for i, c in enumerate(current_batch):
                     global_idx = start_idx + i + 1
                     sim_pct = f"{int(c['similarity'] * 100)}%"
+
+                    # Highlight owned with visual marker
+                    own_mark = "*" if c.get("is_owned") else ""
+
                     print(
-                        f"{global_idx:<3} {sim_pct:<5} {c['country']:<4} {c['date']:<6} {c['artist'][:19]:<20} {c['album_title']}"
+                        f"{global_idx:<3} {own_mark:<3} {sim_pct:<5} {c['country']:<4} {c['date']:<6} {c['artist'][:19]:<20} {c['album_title']}"
                     )
 
                 print("-" * 80)
@@ -418,13 +507,14 @@ class MusicLibraryManager:
                 prompt_options.append("(0) Skip")
                 prompt_options.append("(Q)uit")
 
-                prompt_str = f"Select Album # (1-{len(candidates)}), " + ", ".join(
-                    prompt_options
+                prompt_str = (
+                    f"Select Album # (1-{len(candidates)}, comma-separated for multiple), "
+                    + ", ".join(prompt_options)
                 )
                 choice = input(f"{prompt_str}: ").lower()
 
                 if choice == "0":
-                    return None
+                    return []
                 elif choice == "q":
                     return "quit"
                 elif choice == "n" and current_page < total_pages - 1:
@@ -433,15 +523,30 @@ class MusicLibraryManager:
                     current_page -= 1
                 else:
                     try:
-                        idx = int(choice)
-                        if 1 <= idx <= len(candidates):
-                            return candidates[idx - 1]
+                        # Handle comma separated selection (e.g. "1, 3, 5")
+                        selections = []
+                        parts = choice.split(",")
+                        valid = True
+                        for part in parts:
+                            part = part.strip()
+                            if not part:
+                                continue
+                            idx = int(part)
+                            if 1 <= idx <= len(candidates):
+                                selections.append(candidates[idx - 1])
+                            else:
+                                valid = False
+                                break
+
+                        if valid and selections:
+                            return selections
+                        print("Invalid selection.")
                     except ValueError:
                         print("Invalid selection.")
         finally:
             self._stop_audio()
 
-    def _safe_move(self, src_path, target_dir, target_filename=None):
+    def _safe_move(self, src_path, target_dir, target_filename=None, operation="move"):
         if not os.path.exists(src_path):
             return None
         if not target_filename:
@@ -470,15 +575,19 @@ class MusicLibraryManager:
             counter += 1
 
         if self.dry_run:
-            logging.info(f"[DRY RUN] Move: {src_path} -> {target_path}")
+            logging.info(f"[DRY RUN] {operation}: {src_path} -> {target_path}")
             return target_path
 
         try:
-            shutil.move(src_path, target_path)
-            logging.info(f"Moved: {src_path} -> {target_path}")
+            if operation == "move":
+                shutil.move(src_path, target_path)
+                logging.info(f"Moved: {src_path} -> {target_path}")
+            else:
+                shutil.copy2(src_path, target_path)
+                logging.info(f"Copied: {src_path} -> {target_path}")
             return target_path
         except Exception as e:
-            logging.error(f"Failed to move {src_path} -> {target_path}: {e}")
+            logging.error(f"Failed to {operation} {src_path} -> {target_path}: {e}")
             if (
                 dir_created
                 and os.path.exists(target_dir)
@@ -490,50 +599,78 @@ class MusicLibraryManager:
                     pass
             return None
 
-    def _handle_id_deduplication(self, path, acoustid_id, quality):
-        """Checks if we have this AcoustID in our library and deduplicates."""
+    def _handle_local_deduplication(self, path, fingerprint, quality):
+        # We perform the check but we do NOT act on it (delete/move) here.
+        # This is purely to inform the user or speed up ID lookup.
+        # Actions are deferred until album selection.
+        match_path, match_score, match_record = self._find_local_fuzzy_match(
+            fingerprint
+        )
+        if not match_path or match_score < self.SIMILARITY_ASK:
+            return True
+
+        # If we found a local match, we still return True so we can present albums to user.
+        # Deduplication happens per-album later.
+        return True
+
+    def _handle_album_deduplication(
+        self, path, acoustid_id, release_id, quality, dispose_source=False
+    ):
+        """
+        Deduplication Strategy:
+        1. Look for existing file with same AcoustID AND same AlbumID.
+        2. If found -> Compare Quality. Keep Best.
+        3. If NOT found -> Return True.
+
+        dispose_source: If True (last iteration), move worse quality new file to dups.
+                        If False (mid iteration), just return False to skip copy.
+        """
         self.cur.execute(
-            "SELECT path, quality_score FROM files WHERE acoustid_id = ? AND processed = 1",
-            (acoustid_id,),
+            "SELECT path, quality_score FROM files WHERE acoustid_id = ? AND album_id = ? AND processed = 1",
+            (acoustid_id, release_id),
         )
         existing = self.cur.fetchone()
 
         if not existing:
-            return True  # Proceed, it's new
+            return True  # Unique for this album, proceed.
 
         existing_path, existing_score = existing
+        # Fix: handle potential NULL scores from DB legacy data
         if existing_score is None:
             existing_score = 0.0
 
         if quality["score"] > existing_score:
-            logging.info(f"ID-Upgrade: {existing_path} -> {path}")
+            logging.info(f"Album-Upgrade: {existing_path} -> {path}")
             print(
-                f" -> Upgrading existing file (Quality: {existing_score} -> {quality['score']})"
+                f" -> Upgrading existing file in album (Quality: {existing_score} -> {quality['score']})"
             )
 
             if not self.dry_run:
-                self._safe_move(existing_path, self.dup_folder)
+                self._safe_move(existing_path, self.dup_folder, operation="move")
                 self.cur.execute("DELETE FROM files WHERE path = ?", (existing_path,))
                 self.conn.commit()
             return True  # Proceed with new file
         else:
-            logging.info(f"ID-Duplicate (Worse): {path} < {existing_path}")
-            print(f" -> Duplicate found (lower/equal quality). Moving to duplicates.")
-            if not self.dry_run:
-                self._safe_move(path, self.dup_folder)
+            logging.info(f"Album-Duplicate (Worse): {path} < {existing_path}")
+            print(f" -> Duplicate found in album (lower/equal quality).")
 
-            # Save metadata anyway so we don't scan again
-            self.cur.execute(
-                "INSERT OR REPLACE INTO files (path, processed, acoustid_id, quality_score, format, file_size) VALUES (?, 1, ?, ?, ?, ?)",
-                (
-                    path,
-                    acoustid_id,
-                    quality["score"],
-                    quality["format"],
-                    quality["size"],
-                ),
-            )
-            self.conn.commit()
+            if dispose_source and not self.dry_run:
+                # Move the source file to duplicates because we are done with it
+                # and it wasn't used in this album (and presumably passed previous album checks)
+                self._safe_move(path, self.dup_folder, operation="move")
+                # Save metadata anyway so we don't scan again
+                self.cur.execute(
+                    "INSERT OR REPLACE INTO files (path, processed, acoustid_id, quality_score, format, file_size) VALUES (?, 1, ?, ?, ?, ?)",
+                    (
+                        path,
+                        acoustid_id,
+                        quality["score"],
+                        quality["format"],
+                        quality["size"],
+                    ),
+                )
+                self.conn.commit()
+
             return False  # Stop processing new file
 
     def _apply_tags(self, file_path, meta):
@@ -592,9 +729,11 @@ class MusicLibraryManager:
         cleaned = "".join(c for c in cleaned if c.isalnum() or c in " -_.")
         return cleaned.strip()
 
-    def _organize_file(self, current_path, artist_dir, album_dir, filename):
+    def _organize_file(
+        self, current_path, artist_dir, album_dir, filename, operation="move"
+    ):
         target_dir = os.path.join(self.destination_folder, artist_dir, album_dir)
-        return self._safe_move(current_path, target_dir, filename)
+        return self._safe_move(current_path, target_dir, filename, operation=operation)
 
     def process_library(self):
         files = [
@@ -615,89 +754,107 @@ class MusicLibraryManager:
                 continue
 
             try:
-                duration, fingerprint = acoustid.fingerprint_file(path)
+                if os.path.getsize(path) == 0:
+                    logging.warning(f"Skipping empty file: {path}")
+                    continue
+            except OSError:
+                logging.warning(f"Skipping inaccessible file: {path}")
+                continue
+
+            try:
+                try:
+                    duration, fingerprint = acoustid.fingerprint_file(path)
+                except (EOFError, OSError, acoustid.FingerprintGenerationError) as e:
+                    logging.warning(
+                        f"Skipping corrupt or unreadable audio file {path}: {e}"
+                    )
+                    continue
+
                 quality = self._calculate_quality(path)
                 if not quality:
                     continue
 
-                # --- STEP 1: Attempt Local Identification (Fingerprint History) ---
-                identified_acoustid, score = self._identify_locally(fingerprint)
+                # Note: We do NOT deduplicate here anymore.
+                # We wait until the album is selected to allow same song in diff albums.
 
-                if identified_acoustid and score >= self.SIMILARITY_AUTO:
-                    logging.info(
-                        f"Local Hit! Identified as {identified_acoustid} (Score: {score:.2f})"
-                    )
-                    current_acoustid_id = identified_acoustid
+                resp = acoustid.lookup(
+                    self.api_key,
+                    fingerprint,
+                    duration,
+                    meta="recordings releases tracks",
+                )
+                if resp.get("status") != "ok" or not resp.get("results"):
+                    logging.warning(f"No match for {path}")
+                    continue
 
-                    # Update cache with THIS specific fingerprint to strengthen future matches
-                    self._update_fingerprint_cache(current_acoustid_id, fingerprint)
+                candidates = self._get_candidates(resp["results"])
+                if not candidates:
+                    continue
 
-                    # Skip API call, proceed directly to deduplication
-                    # We might need to fetch metadata from existing files if this is a new file
-                    # But if we are just deduplicating, ID is enough.
+                # Identify ID from top match
+                top_match = candidates[0]
+                current_acoustid_id = resp["results"][0]["id"]
 
-                    # Check duplication
-                    if not self._handle_id_deduplication(
-                        path, current_acoustid_id, quality
-                    ):
-                        continue
+                # Update History Cache
+                self._update_fingerprint_cache(current_acoustid_id, fingerprint)
 
-                    # If we proceed here, it means we kept this file.
-                    # Problem: We bypassed API, so we don't have fresh metadata (candidates).
-                    # We must assume the existing metadata in the DB is good OR we fetch API only for metadata.
-                    # For safety, let's fetch API for metadata if we are keeping the file.
-                    logging.info("Fetching metadata for local match...")
+                # --- NEW LOGIC START ---
+                # Check for local matches to highlight and re-sort
+                owned_ids = self._get_owned_release_ids(current_acoustid_id)
+                for c in candidates:
+                    c["is_owned"] = c["release"]["id"] in owned_ids
 
+                # Re-sort candidates: Owned -> Similarity -> Country -> Date
+                candidates.sort(
+                    key=lambda x: (
+                        x["is_owned"],
+                        x["similarity"],
+                        x["country"] == "US",
+                        x["date"],
+                    ),
+                    reverse=True,
+                )
+
+                # Update top match after sorting (in case an owned item moved to top)
+                top_match = candidates[0]
+                # --- NEW LOGIC END ---
+
+                # User Selection / Auto Selection
+                selected_matches = []
+                if len(candidates) == 1 or top_match["similarity"] >= 0.98:
+                    selected_matches = [top_match]
                 else:
-                    # --- STEP 2: API Lookup (If Local Failed) ---
-                    resp = acoustid.lookup(
-                        self.api_key,
-                        fingerprint,
-                        duration,
-                        meta="recordings releases tracks",
-                    )
-                    if resp.get("status") != "ok" or not resp.get("results"):
-                        logging.warning(f"No match for {path}")
-                        continue
+                    result = self._prompt_user_selection(path, candidates)
+                    if result == "quit":
+                        logging.info("User initiated quit.")
+                        self.close()
+                        sys.exit(0)
+                    selected_matches = result or []
 
-                    candidates = self._get_candidates(resp["results"])
-                    if not candidates:
-                        continue
+                if not selected_matches:
+                    logging.info(f"Skipped by user: {path}")
+                    continue
 
-                    # Identify ID from API results
-                    top_match = candidates[0]
-                    current_acoustid_id = resp["results"][0][
-                        "id"
-                    ]  # Using top result ID
+                # Iterate over selected albums
+                for idx, selected_match in enumerate(selected_matches):
+                    # Flag to identify the last iteration
+                    is_last_item = idx == len(selected_matches) - 1
 
-                    # Update History Cache
-                    self._update_fingerprint_cache(current_acoustid_id, fingerprint)
-
-                    # Deduplication
-                    if not self._handle_id_deduplication(
-                        path, current_acoustid_id, quality
-                    ):
-                        continue
-
-                    # User Selection / Auto Selection
-                    selected_match = None
-                    if len(candidates) == 1 or top_match["similarity"] >= 0.98:
-                        selected_match = top_match
-                    else:
-                        selected_match = self._prompt_user_selection(path, candidates)
-                        if selected_match == "quit":
-                            logging.info("User initiated quit.")
-                            self.close()
-                            sys.exit(0)
-
-                    if not selected_match:
-                        logging.info(f"Skipped by user: {path}")
-                        continue
-
-                    # EXTRACT METADATA
                     rel = selected_match["release"]
                     rec = selected_match["recording"]
                     target_recording_id = rec.get("id")
+                    target_release_id = rel.get("id")  # The Album ID
+
+                    # --- STEP: Album-Scoped Deduplication ---
+                    if not self._handle_album_deduplication(
+                        path,
+                        current_acoustid_id,
+                        target_release_id,
+                        quality,
+                        dispose_source=is_last_item,
+                    ):
+                        continue
+                    # ----------------------------------------
 
                     artist = (
                         rel.get("artists", [{}])[0].get("name")
@@ -755,19 +912,39 @@ class MusicLibraryManager:
                         "track_no": track_num,
                         "disc_no": disc_num,
                         "release_date": str(rel.get("date", {}).get("year", "0000")),
-                        "release_id": rel.get("id"),
+                        "release_id": target_release_id,
                     }
-
-                    self._apply_tags(path, meta)
 
                     safe_artist = self._sanitize_name(meta["album_artist"])
                     safe_album = self._sanitize_name(meta["album"])
                     raw_filename = f"{str(meta['track_no']).zfill(2)} - {meta['title']}{quality['format']}"
                     safe_filename = self._sanitize_name(raw_filename)
 
-                    final_path = self._organize_file(
-                        path, safe_artist, safe_album, safe_filename
-                    )
+                    # Move file or Copy file
+                    final_path = None
+                    if is_last_item:
+                        final_path = self._organize_file(
+                            path,
+                            safe_artist,
+                            safe_album,
+                            safe_filename,
+                            operation="move",
+                        )
+                    else:
+                        final_path = self._organize_file(
+                            path,
+                            safe_artist,
+                            safe_album,
+                            safe_filename,
+                            operation="copy",
+                        )
+
+                    if not final_path:
+                        # Move/Copy failed
+                        continue
+
+                    # Apply tags to the DESTINATION file
+                    self._apply_tags(final_path, meta)
 
                     self.cur.execute(
                         "INSERT OR IGNORE INTO albums VALUES (?,?,?,?,?)",
@@ -796,13 +973,19 @@ class MusicLibraryManager:
                             1,
                         ),
                     )
+
+                    # Update Fingerprint Index (Only needs to happen once per unique file, but okay to repeat as it deletes old)
+                    self._update_index(final_path, fingerprint)
+
                     self.conn.commit()
                     print(
                         f" -> Success: {os.path.join(safe_artist, safe_album, safe_filename)}"
                     )
 
             except Exception as e:
+                # Log traceback for better debugging
                 logging.error(f"Critical Failure on {path}: {e}")
+                logging.error(traceback.format_exc())
                 print(f" -> Error: {e}")
 
     def __del__(self):
@@ -812,10 +995,10 @@ class MusicLibraryManager:
 if __name__ == "__main__":
     CONFIG = {
         "api_key": "7dlZplmc3N",
-        "music_folder": "/mnt/ssk/music/",
+        "music_folder": "/mnt/ssk/music/AllMusic2/",
         "destination_folder": "/mnt/ssk/NewMaster",
         "dup_folder": "/mnt/ssk/duplicates",
-        "db_path": "library_manager_v2.db",
+        "db_path": "library_manager.db",
         "dry_run": False,
     }
 
