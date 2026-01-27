@@ -604,6 +604,19 @@ class MusicLibraryManager:
                     pass
             return None
 
+    def cleanup_empty_folders(self):
+        """Recursively removes empty folders in the music dir."""
+        if not os.path.exists(self.music_folder):
+            return
+        print("Cleaning up empty source folders...")
+        for root, dirs, _ in os.walk(self.music_folder, topdown=False):
+            for name in dirs:
+                try:
+                    p = os.path.join(root, name)
+                    os.rmdir(p)  # Only removes if empty
+                except OSError:
+                    pass
+
     def _handle_local_deduplication(self, path, fingerprint, quality):
         # We perform the check but we do NOT act on it (delete/move) here.
         # This is purely to inform the user or speed up ID lookup.
@@ -1003,6 +1016,9 @@ class MusicLibraryManager:
                 logging.error(f"Critical Failure on {path}: {e}")
                 logging.error(traceback.format_exc())
                 print(f" -> Error: {e}")
+
+        # Cleanup empty source folders at end of run
+        self.cleanup_empty_folders()
 
     def __del__(self):
         self.close()
