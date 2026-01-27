@@ -1,0 +1,1 @@
+find /mnt/ssk/music -type f \( -name "*.jpg" -o -name "*.ini" -o -name "*.Identifier" \) -delete
