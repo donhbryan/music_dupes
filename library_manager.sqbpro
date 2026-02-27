@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?><sqlb_project><db path="/home/don/Scripts/python/music_dupes/library_manager.db" readonly="0" foreign_keys="" case_sensitive_like="" temp_store="" wal_autocheckpoint="" synchronous=""/><attached/><window><main_tabs open="browser pragmas query structure" current="0"/></window><tab_structure><column_width id="0" width="300"/><column_width id="1" width="0"/><column_width id="2" width="100"/><column_width id="3" width="1740"/><column_width id="4" width="0"/></tab_structure><tab_browse><current_table name="0,0:"/><default_encoding codec=""/><browse_table_settings/></tab_browse><tab_sql><sql name="selects.sql">
+select path, title, track_no, format from files
+--  where acoustid_id is not null
+where lower(title) like lower('%A psalm for bob marley%')
+-- where score is NULL
+
+ order by path, album_id,track_no, title;
+ COMMIT;
+ select * from albums where lower(album_title) like '%road%' order by 2; commit;
+ 
+ select release_id, album_title from album_tracks_V where title like  '%I Love King Selassie%';
+ 
+ select * from album_tracks_V where lower(album_artist) like lower('%black uhuru%')
+ order by album_title,path</sql><sql name="SQL 2">CREATE  view if not EXISTS album_tracks_V as
+SELECT album_artist , album_title, title, path 
+from albums as a 
+INNER JOIN files as f
+on a.release_id = f.album_id </sql><sql name="album_tracks_V.sql">DROP VIEW &quot;main&quot;.&quot;album_tracks_V&quot;;
+CREATE VIEW album_tracks_V as
+SELECT release_id, album_artist , album_title, substr('00'||track_no,-2,2)||' '||title as title, path 
+from albums as a 
+INNER JOIN files as f
+on a.release_id = f.album_id
+order by 1 , 2 , 3
+commit;
+</sql><current_tab id="2"/></tab_sql></sqlb_project>
