@@ -14,5 +14,5 @@ def cleanup_empty_folders(folder):
                     pass
 
 if __name__ == "__main__":
-    folder = "/mnt/ssk/unresolved"
+    folder = "/mnt/ssk/music"
     cleanup_empty_folders(folder)
