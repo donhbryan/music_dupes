@@ -1063,7 +1063,7 @@ class MusicLibraryManager:
 if __name__ == "__main__":
     CONFIG = {
         "api_key": "7dlZplmc3N",
-        "music_folder": "/mnt/ssk/music/",
+        "music_folder": "/mnt/NAS/lost+found/",
         "destination_folder": "/mnt/ssk/NewMaster",
         "dup_folder": "/mnt/ssk/duplicates",
         "unresolved_folder": "/mnt/ssk/unresolved",
