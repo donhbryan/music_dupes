@@ -56,7 +56,8 @@ class MusicLibraryManager:
         self._setup_database()
 
         # Pruning MUST happen after DB init
-        self.prune_database()
+        # self.prune_database()
+        # TODO: Consider pruning after processing to clean up any moved/deleted files from DB. Pruning before processing can lead to issues if files were moved/deleted outside of this script since last run, but it can also be time-consuming on large libraries. Maybe add a command-line flag to control when pruning happens?
 
         if not os.path.exists(self.dup_folder):
             os.makedirs(self.dup_folder)
