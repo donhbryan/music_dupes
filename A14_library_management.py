@@ -9,14 +9,14 @@ import acoustid
 import difflib
 import mutagen
 import traceback
-from mutagen.id3 import ID3, TPE1, TPE2, TRCK, TPOS, TIT2, TALB
-from tqdm import tqdm
 import json
 import hashlib
+import argparse
+from mutagen.id3 import ID3, TPE1, TPE2, TRCK, TPOS, TIT2, TALB
+from tqdm import tqdm
 
 
 class MusicLibraryManager:
-
     def __init__(self, config_file="config.json"):
         # Load the configuration from the JSON file
         try:
@@ -33,19 +33,17 @@ class MusicLibraryManager:
         self.destination_folder = os.path.abspath(config.get("destination_folder", ""))
         self.dup_folder = os.path.abspath(config.get("dup_folder", ""))
         self.unresolved_folder = os.path.abspath(config.get("unresolved_folder", ""))
-        self.db_path = config.get("db_path", "library.db")
+        self.db_path = config.get("db_path", "library_manager.db")
         self.dry_run = config.get("dry_run", False)
 
         self.player_process = None
 
         # Tuning for fuzzy matching
         self.BLOCK_SIZE = 16
-        self.SIMILARITY_AUTO = 0.98  # Automatically handle matches > 98% (if unique)
-        self.SIMILARITY_STICKY = (
-            0.95  # Auto-match to previously selected album if > 95%
-        )
-        self.SIMILARITY_ASK = 0.85  # Ask user for matches > 85%
-        self.API_SLEEP = 0.4  # Throttle API calls
+        self.SIMILARITY_AUTO = 0.98
+        self.SIMILARITY_STICKY = 0.95
+        self.SIMILARITY_ASK = 0.85
+        self.API_SLEEP = 0.4
 
         # State tracking for sticky album selection
         self.last_selected_album_id = None
@@ -59,10 +57,6 @@ class MusicLibraryManager:
         self.conn = sqlite3.connect(self.db_path)
         self.cur = self.conn.cursor()
         self._setup_database()
-
-        # Pruning MUST happen after DB init
-        # self.prune_database()
-        # TODO: Consider pruning after processing to clean up any moved/deleted files from DB. Pruning before processing can lead to issues if files were moved/deleted outside of this script since last run, but it can also be time-consuming on large libraries. Maybe add a command-line flag to control when pruning happens?
 
         if not os.path.exists(self.dup_folder):
             os.makedirs(self.dup_folder)
@@ -138,7 +132,8 @@ class MusicLibraryManager:
         self.cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_file_blocks ON fingerprint_index(block)"
         )
-        # --- NEW: Exact File Hash Tracking ---
+
+        # Exact File Hash Tracking
         self.cur.execute(
             """CREATE TABLE IF NOT EXISTS file_hashes (
                             file_hash TEXT PRIMARY KEY,
@@ -163,17 +158,13 @@ class MusicLibraryManager:
 
             for (path_str,) in tqdm(all_paths, desc="Pruning DB"):
                 if not os.path.exists(path_str):
-                    # Remove from the main files table
                     self.conn.execute("DELETE FROM files WHERE path = ?", (path_str,))
-                    # Remove from the fingerprint blocking index
                     self.conn.execute(
                         "DELETE FROM fingerprint_index WHERE path = ?", (path_str,)
                     )
-                    # --- NEW: Remove the stale hash entry ---
                     self.conn.execute(
                         "DELETE FROM file_hashes WHERE path = ?", (path_str,)
                     )
-
                     removed_count += 1
 
         if removed_count > 0:
@@ -182,19 +173,53 @@ class MusicLibraryManager:
         else:
             print("Database is clean.")
 
-    # --- HASH the file for exact duplicate detection (optional, can be used for a future enhancement) ---
     def _get_file_hash(self, filepath):
         """Calculates a fast MD5 hash of the file for exact duplicate detection."""
         hasher = hashlib.md5()
         try:
             with open(filepath, "rb") as f:
-                # Read in 4MB chunks for optimal NAS/network transfer speed
                 for chunk in iter(lambda: f.read(4096 * 1024), b""):
                     hasher.update(chunk)
             return hasher.hexdigest()
         except OSError as e:
             logging.error(f"Hashing failed for {filepath}: {e}")
             return None
+
+    def prepopulate_hashes(self):
+        """Scans the database for already-processed files and retroactively generates their MD5 hashes."""
+        print("Checking for existing files that need to be hashed...")
+
+        self.cur.execute("SELECT path FROM files")
+        known_paths = [row[0] for row in self.cur.fetchall()]
+
+        if not known_paths:
+            print("No existing files found in the database to hash.")
+            return
+
+        added_count = 0
+
+        for path in tqdm(known_paths, desc="Hashing existing files"):
+            if not os.path.exists(path):
+                continue
+
+            self.cur.execute("SELECT 1 FROM file_hashes WHERE path = ?", (path,))
+            if self.cur.fetchone():
+                continue
+
+            file_hash = self._get_file_hash(path)
+            if file_hash:
+                self.cur.execute(
+                    "INSERT OR REPLACE INTO file_hashes (file_hash, path) VALUES (?, ?)",
+                    (file_hash, path),
+                )
+                added_count += 1
+
+        self.conn.commit()
+
+        if added_count > 0:
+            print(f"Successfully added {added_count} new file hashes to the database.")
+        else:
+            print("All known files are already hashed.")
 
     # --- FINGERPRINT ENGINE ---
     def _get_blocks(self, fingerprint):
@@ -212,7 +237,6 @@ class MusicLibraryManager:
                 (fingerprint, acoustid_id),
             )
 
-            # Optimization: check existence before bulk insert
             self.cur.execute(
                 "SELECT 1 FROM known_blocks WHERE acoustid_id = ? LIMIT 1",
                 (acoustid_id,),
@@ -265,15 +289,10 @@ class MusicLibraryManager:
             return set()
 
     def _find_local_fuzzy_match(self, fingerprint):
-        """
-        Uses blocking strategy to find candidates, then difflib for fuzzy matching.
-        Returns: (best_match_path, match_score, match_record)
-        """
         blocks = self._get_blocks(fingerprint)
         if not blocks:
             return None, 0.0, None
 
-        # 1. Block Search: Find files sharing fingerprint blocks
         placeholders = ",".join(["?"] * len(blocks))
         query = f"SELECT DISTINCT path FROM fingerprint_index WHERE block IN ({placeholders})"
         self.cur.execute(query, blocks)
@@ -283,7 +302,6 @@ class MusicLibraryManager:
         best_score = 0.0
         best_record = None
 
-        # 2. Fuzzy Matching: Detailed comparison
         for cand_path in candidates:
             self.cur.execute(
                 "SELECT fingerprint, quality_score, format, file_size FROM files WHERE path = ?",
@@ -294,12 +312,9 @@ class MusicLibraryManager:
                 continue
 
             cand_fp, cand_q, cand_fmt, cand_size = res
-
-            # Handle NULL scores in DB
             if cand_q is None:
                 cand_q = 0.0
 
-            # Calculate similarity
             ratio = difflib.SequenceMatcher(None, fingerprint, cand_fp).ratio()
 
             if ratio > best_score:
@@ -310,15 +325,10 @@ class MusicLibraryManager:
         return best_path, best_score, best_record
 
     def _identify_locally(self, fingerprint):
-        """
-        Attempts to identify the AcoustID locally using historical fingerprints.
-        Returns: (acoustid_id, confidence_score) or (None, 0.0)
-        """
         blocks = self._get_blocks(fingerprint)
         if not blocks:
             return None, 0.0
 
-        # 1. Block Search: Find candidate AcoustIDs sharing blocks
         placeholders = ",".join(["?"] * len(blocks))
         query = f"SELECT DISTINCT acoustid_id FROM known_blocks WHERE block IN ({placeholders})"
         self.cur.execute(query, blocks)
@@ -330,9 +340,7 @@ class MusicLibraryManager:
         best_id = None
         best_score = 0.0
 
-        # 2. Fuzzy Match against ALL fingerprints for these IDs
         for cid in candidate_ids:
-            # Get all historical fingerprints for this ID
             self.cur.execute(
                 "SELECT fingerprint FROM known_fingerprints WHERE acoustid_id = ?",
                 (cid,),
@@ -525,7 +533,6 @@ class MusicLibraryManager:
 
                 print(f"\n[!] Ambiguous API Match for file: {file_path}")
                 print(f"    Page {current_page + 1}/{total_pages}")
-                # Added 'Own' column header
                 print(
                     f"{'#':<3} {'Own':<3} {'Sim':<5} {'Ctry':<4} {'Date':<6} {'Artist':<25} {'Album'}"
                 )
@@ -534,8 +541,6 @@ class MusicLibraryManager:
                 for i, c in enumerate(current_batch):
                     global_idx = start_idx + i + 1
                     sim_pct = f"{int(c['similarity'] * 100)}%"
-
-                    # Highlight owned with visual marker
                     own_mark = "*" if c.get("is_owned") else ""
 
                     print(
@@ -568,7 +573,6 @@ class MusicLibraryManager:
                     current_page -= 1
                 else:
                     try:
-                        # Handle comma separated selection (e.g. "1, 3, 5")
                         selections = []
                         parts = choice.split(",")
                         valid = True
@@ -653,36 +657,21 @@ class MusicLibraryManager:
             for name in dirs:
                 try:
                     p = os.path.join(root, name)
-                    os.rmdir(p)  # Only removes if empty
+                    os.rmdir(p)
                 except OSError:
                     pass
 
     def _handle_local_deduplication(self, path, fingerprint, quality):
-        # We perform the check but we do NOT act on it (delete/move) here.
-        # This is purely to inform the user or speed up ID lookup.
-        # Actions are deferred until album selection.
         match_path, match_score, match_record = self._find_local_fuzzy_match(
             fingerprint
         )
         if not match_path or match_score < self.SIMILARITY_ASK:
             return True
-
-        # If we found a local match, we still return True so we can present albums to user.
-        # Deduplication happens per-album later.
         return True
 
     def _handle_album_deduplication(
         self, path, acoustid_id, release_id, quality, dispose_source=False
     ):
-        """
-        Deduplication Strategy:
-        1. Look for existing file with same AcoustID AND same AlbumID.
-        2. If found -> Compare Quality. Keep Best.
-        3. If NOT found -> Return True.
-
-        dispose_source: If True (last iteration), move worse quality new file to dups.
-                        If False (mid iteration), just return False to skip copy.
-        """
         self.cur.execute(
             "SELECT path, quality_score FROM files WHERE acoustid_id = ? AND album_id = ? AND processed = 1",
             (acoustid_id, release_id),
@@ -690,10 +679,9 @@ class MusicLibraryManager:
         existing = self.cur.fetchone()
 
         if not existing:
-            return True  # Unique for this album, proceed.
+            return True
 
         existing_path, existing_score = existing
-        # Fix: handle potential NULL scores from DB legacy data
         if existing_score is None:
             existing_score = 0.0
 
@@ -707,16 +695,13 @@ class MusicLibraryManager:
                 self._safe_move(existing_path, self.dup_folder, operation="move")
                 self.cur.execute("DELETE FROM files WHERE path = ?", (existing_path,))
                 self.conn.commit()
-            return True  # Proceed with new file
+            return True
         else:
             logging.info(f"Album-Duplicate (Worse): {path} < {existing_path}")
             print(f" -> Duplicate found in album (lower/equal quality).")
 
             if dispose_source and not self.dry_run:
-                # Move the source file to duplicates because we are done with it
-                # and it wasn't used in this album (and presumably passed previous album checks)
                 self._safe_move(path, self.dup_folder, operation="move")
-                # Save metadata anyway so we don't scan again
                 self.cur.execute(
                     "INSERT OR REPLACE INTO files (path, processed, acoustid_id, quality_score, format, file_size) VALUES (?, 1, ?, ?, ?, ?)",
                     (
@@ -729,7 +714,7 @@ class MusicLibraryManager:
                 )
                 self.conn.commit()
 
-            return False  # Stop processing new file
+            return False
 
     def _apply_tags(self, file_path, meta):
         if self.dry_run:
@@ -812,7 +797,7 @@ class MusicLibraryManager:
                 continue
 
             # ==========================================
-            # NEW: FAST EXACT DUPLICATE CHECK
+            # FAST EXACT DUPLICATE CHECK
             # ==========================================
             file_hash = self._get_file_hash(path)
             if file_hash:
@@ -824,10 +809,8 @@ class MusicLibraryManager:
                     print(f" -> Exact binary duplicate of a known file. Skipping API.")
                     print(f"    (Matches: {os.path.basename(existing_path)})")
 
-                    # 1. Let _safe_move handle its own dry_run logging
                     self._safe_move(path, self.dup_folder, operation="move")
 
-                    # 2. Protect the database updates so dry runs don't save state
                     if not self.dry_run:
                         self.cur.execute(
                             "INSERT OR REPLACE INTO files (path, processed) VALUES (?, 1)",
@@ -839,7 +822,7 @@ class MusicLibraryManager:
                             f" -> [DRY RUN] Would update database to mark as processed duplicate."
                         )
 
-                    continue  # Skip the AcoustID lookup for this file
+                    continue
             # ==========================================
 
             try:
@@ -863,9 +846,6 @@ class MusicLibraryManager:
                 if not quality:
                     continue
 
-                # Note: We do NOT deduplicate here anymore.
-                # We wait until the album is selected to allow same song in diff albums.
-
                 resp = acoustid.lookup(
                     self.api_key,
                     fingerprint,
@@ -874,34 +854,27 @@ class MusicLibraryManager:
                 )
                 if resp.get("status") != "ok" or not resp.get("results"):
                     logging.warning(f"No match for {path}")
-                    # Change: Move files with no match to unresolved folder
                     print(f" -> No match found. Moving to unresolved.")
                     self._safe_move(path, self.unresolved_folder, operation="move")
                     continue
 
                 candidates = self._get_candidates(resp["results"])
 
-                # Check for candidates again (just in case parsing returned empty list)
                 if not candidates:
                     logging.warning(f"No valid candidates parsed for {path}")
                     print(f" -> No candidates. Moving to unresolved.")
                     self._safe_move(path, self.unresolved_folder, operation="move")
                     continue
 
-                # Identify ID from top match
                 top_match = candidates[0]
                 current_acoustid_id = resp["results"][0]["id"]
 
-                # Update History Cache
                 self._update_fingerprint_cache(current_acoustid_id, fingerprint)
 
-                # --- NEW LOGIC START ---
-                # Check for local matches to highlight and re-sort
                 owned_ids = self._get_owned_release_ids(current_acoustid_id)
                 for c in candidates:
                     c["is_owned"] = c["release"]["id"] in owned_ids
 
-                # Re-sort candidates: Owned -> Similarity -> Country -> Date
                 candidates.sort(
                     key=lambda x: (
                         x["is_owned"],
@@ -912,15 +885,10 @@ class MusicLibraryManager:
                     reverse=True,
                 )
 
-                # Update top match after sorting (in case an owned item moved to top)
                 top_match = candidates[0]
-                # --- NEW LOGIC END ---
-
-                # User Selection / Auto Selection
                 selected_matches = []
-
-                # 1. Sticky Album Selection (Context Awareness)
                 sticky_match = None
+
                 if self.last_selected_album_id:
                     for c in candidates:
                         if (
@@ -935,13 +903,10 @@ class MusicLibraryManager:
                         f"Auto-selected sticky album: {sticky_match['album_title']}"
                     )
                     selected_matches = [sticky_match]
-                # 2. Strict Auto-Select (Only if exactly 1 high-quality match)
                 elif len(candidates) == 1 and top_match["similarity"] >= 0.98:
                     selected_matches = [top_match]
-                    # Update sticky ID since it's a confident auto-select
                     self.last_selected_album_id = top_match["release"]["id"]
                 else:
-                    # 3. Prompt User (Multiple high matches or ambiguous)
                     result = self._prompt_user_selection(path, candidates)
                     if result == "quit":
                         logging.info("User initiated quit.")
@@ -949,33 +914,24 @@ class MusicLibraryManager:
                         sys.exit(0)
                     selected_matches = result or []
 
-                    # Update Sticky ID if user made a single clear choice
                     if len(selected_matches) == 1:
                         self.last_selected_album_id = selected_matches[0]["release"][
                             "id"
                         ]
                     else:
-                        # Ambiguous or skipped, reset sticky context
                         self.last_selected_album_id = None
 
                 if not selected_matches:
                     logging.info(f"Skipped by user: {path}")
-                    # If skipped by user, we might also want to move to unresolved,
-                    # or keep in place. User intent on 'skip' is usually 'don't touch'.
-                    # Leaving it as is.
                     continue
 
-                # Iterate over selected albums
                 for idx, selected_match in enumerate(selected_matches):
-                    # Flag to identify the last iteration
                     is_last_item = idx == len(selected_matches) - 1
-
                     rel = selected_match["release"]
                     rec = selected_match["recording"]
                     target_recording_id = rec.get("id")
-                    target_release_id = rel.get("id")  # The Album ID
+                    target_release_id = rel.get("id")
 
-                    # --- STEP: Album-Scoped Deduplication ---
                     if not self._handle_album_deduplication(
                         path,
                         current_acoustid_id,
@@ -984,7 +940,6 @@ class MusicLibraryManager:
                         dispose_source=is_last_item,
                     ):
                         continue
-                    # ----------------------------------------
 
                     artist = (
                         rel.get("artists", [{}])[0].get("name")
@@ -1050,7 +1005,6 @@ class MusicLibraryManager:
                     raw_filename = f"{str(meta['track_no']).zfill(2)} - {meta['title']}{quality['format']}"
                     safe_filename = self._sanitize_name(raw_filename)
 
-                    # Move file or Copy file
                     final_path = None
                     if is_last_item:
                         final_path = self._organize_file(
@@ -1070,10 +1024,8 @@ class MusicLibraryManager:
                         )
 
                     if not final_path:
-                        # Move/Copy failed
                         continue
 
-                    # Apply tags to the DESTINATION file
                     self._apply_tags(final_path, meta)
 
                     self.cur.execute(
@@ -1104,10 +1056,8 @@ class MusicLibraryManager:
                         ),
                     )
 
-                    # Update Fingerprint Index (Only needs to happen once per unique file, but okay to repeat as it deletes old)
                     self._update_index(final_path, fingerprint)
 
-                    # --- NEW: Save the exact file hash ---
                     if file_hash:
                         self.cur.execute(
                             "INSERT OR REPLACE INTO file_hashes (file_hash, path) VALUES (?, ?)",
@@ -1120,21 +1070,50 @@ class MusicLibraryManager:
                     )
 
             except Exception as e:
-                # Log traceback for better debugging
                 logging.error(f"Critical Failure on {path}: {e}")
                 logging.error(traceback.format_exc())
                 print(f" -> Error: {e}")
 
-        # Cleanup empty source folders at end of run
         self.cleanup_empty_folders()
 
     def __del__(self):
         self.close()
 
-if __name__ == "__main__":
-    config_filename = "library_management_config.json"
 
-    # Auto-generate a default config file if it doesn't exist
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="AcoustID Music Library Manager & Deduplicator"
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        default="config.json",
+        help="Path to the JSON configuration file.",
+    )
+    parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="Clean up database entries for files that no longer exist.",
+    )
+    parser.add_argument(
+        "--prepopulate",
+        action="store_true",
+        help="Generate MD5 hashes for all previously processed files.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run without moving files (overrides JSON config).",
+    )
+    parser.add_argument(
+        "--process",
+        action="store_true",
+        help="Process the music folder (Default action if no other flags are passed).",
+    )
+
+    args = parser.parse_args()
+    config_filename = args.config
+
     if not os.path.exists(config_filename):
         print(
             f"[{config_filename}] not found. Generating a default configuration file..."
@@ -1146,19 +1125,36 @@ if __name__ == "__main__":
             "dup_folder": "/mnt/NAS/cleanmusic/duplicates/",
             "unresolved_folder": "/mnt/NAS/cleanmusic/unresolved/",
             "db_path": "library_manager.db",
-            "dry_run": "False",
+            "dry_run": False,
         }
         with open(config_filename, "w") as f:
             json.dump(default_config, f, indent=4)
-
         print(
             f"Default configuration created! Please review '{config_filename}' and run the script again."
         )
         sys.exit(0)
 
-    # Initialize with the JSON file
     manager = MusicLibraryManager(config_file=config_filename)
+
+    if args.dry_run:
+        manager.dry_run = True
+        print("\n[!] DRY RUN MODE ACTIVATED VIA CLI [!]\n")
+
+    run_process = args.process or not (args.prune or args.prepopulate)
+
     try:
-        manager.process_library()
+        if args.prune:
+            manager.prune_database()
+            print("-" * 40)
+
+        if args.prepopulate:
+            manager.prepopulate_hashes()
+            print("-" * 40)
+
+        if run_process:
+            manager.process_library()
+
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user. Shutting down gracefully...")
     finally:
         manager.close()
