@@ -1,8 +1,12 @@
-AcoustID Music Library Manager & Deduplicator
+# AcoustID Music Library Manager & Deduplicator
+
+---
 An intelligent, automated Python tool designed to sort, tag, organize, and deduplicate massive music libraries. Built for NAS environments and large messy collections, this script uses audio fingerprinting (AcoustID) and fast MD5 hashing to ensure your master library contains only the highest-quality version of every track, perfectly tagged and organized.
 
-✨ Key Features
-Audio Fingerprinting: Uses AcoustID and MusicBrainz to identify tracks by their actual audio profile, ignoring incorrect or missing ID3 tags.
+## ✨ Key Features
+
+Audio Fingerprinting:
+    * Uses AcoustID and MusicBrainz to identify tracks by their actual audio profile, ignoring incorrect or missing ID3 tags.
 
 Smart Quality Deduplication: If duplicate tracks are found, the script calculates a "quality score" (based on lossless formats, bit depth, and file size) and strictly keeps the best version, moving the inferior file to a duplicates folder.
 
@@ -20,7 +24,8 @@ JSON Configuration: Easily manage paths and API keys without touching the core P
 
 Robust SQLite Tracking: Maintains a local database of processed files, known fingerprints, and file hashes to speed up future runs and handle interruptions gracefully.
 
-🛠️ Prerequisites
+### 🛠️ Prerequisites
+
 Python Dependencies
 You will need Python 3.8+ and the following libraries:
 
@@ -38,19 +43,22 @@ For the terminal audio preview feature to work during ambiguous matches, ensure 
 API Key
 You will need a free AcoustID API key. Register an application at acoustid.org to get one.
 
-⚙️ Configuration
+### ⚙️ Configuration
+
 On the first run, the script will automatically generate a config.json file in the same directory. Edit this file with your specific paths and API key:
 
-JSON
+```JSON
 {
     "api_key": "YOUR_ACOUSTID_API_KEY",
-    "music_folder": "/mnt/NAS/cleanmusic/music/",
-    "destination_folder": "/mnt/NAS/cleanmusic/NewMaster/",
-    "dup_folder": "/mnt/NAS/cleanmusic/duplicates/",
-    "unresolved_folder": "/mnt/NAS/cleanmusic/unresolved/",
+    "music_folder": "/MUSIC_SOURCE_FOLDER/",
+    "destination_folder": "/TARGET_FOLDER_WITH_BEST_QUALITY/",
+    "dup_folder": "/FOLDER_FOR_DUPLICATES/",
+    "unresolved_folder": "/FOLDER_FOR_UNPROCESSED_FILES/",
     "db_path": "library_manager.db",
-    "dry_run": false
+    "dry_run": "false"
 }
+```
+
 music_folder: Where your unsorted, messy music is located.
 
 destination_folder: Where your organized, tagged master library will be built.
@@ -59,47 +67,62 @@ dup_folder: Where lower-quality duplicates and exact copies are sent.
 
 unresolved_folder: Where files with no AcoustID match are safely moved.
 
-🚀 Usage
+## 🚀 Usage
+
 The script is executed via the command line and includes several flags for precise control over your library management.
 
 Basic Processing
 To run the script using the default settings in your config.json:
 
-Bash
+```
 python library_manager.py
+```
+
 (You can also explicitly pass --process to achieve the same result).
 
 Safe Testing (Dry Run)
 Want to see what the script would do without actually moving files or updating the database?
 
-Bash
+```Bash
 python library_manager.py --dry-run
+```
+
 Using a Custom Config
 Useful if you want to test on a small subset of files or manage multiple distinct libraries:
 
-Bash
+```Bash
 python library_manager.py -c test_config.json
-🧽 Database Maintenance Options
+```
+
+#### 🧽 Database Maintenance Options
+
 Because the script uses a local SQLite database to track processed files and hashes, you may occasionally need to perform maintenance—especially if you delete or manually move files in your destination_folder outside of the script.
 
 1. Prune Ghost Entries
 If you manually delete files from your NAS, the database will still think they exist. Use --prune to check all database entries against your actual filesystem and remove dead links:
 
-Bash
+```Bash
 python library_manager.py --prune
+```
+
 2. Retroactive Hashing (Prepopulate)
 If you update the script to a new version supporting MD5 hashing, but already have thousands of files processed in your database, use --prepopulate. This will scan your existing master library and generate MD5 hashes for ultra-fast future duplicate detection:
 
-Bash
+```Bash
 python library_manager.py --prepopulate
+```
+
 3. The Full Maintenance Pipeline
 You can chain commands together. To clean up dead database links, update all file hashes, and then process any new incoming music in one go:
 
-Bash
+```Bash
 python library_manager.py --prune --prepopulate --process
-🧠 How Deduplication Works
+```
+
+### 🧠 How Deduplication Works
+
 The Fast Pass (Exact Match): The script reads the incoming file and generates an MD5 hash. If that hash already exists in the database, the file is instantly moved to the dup_folder. No API calls, no audio decoding.
 
 The Smart Pass (Audio Quality Match): If the file is technically distinct (different bitrates, different encodings), it generates an AcoustID fingerprint. If the API confirms the song belongs to an Album you already have, the script calculates a quality score.
 
-The Outcome: The script strictly enforces quality. If the new file is better (e.g., FLAC replacing a 128kbps MP3), it upgrades your master library and sends the old file to the duplicates folder. If the new file is worse, it goes straight to the duplicates folder.
+The Outcome: The script strictly enforces quality. If the new file is better (e.g., FLAC replacing a 128kbps MP3), it upgrades your master library and sends the old file to the duplicates folder. If the quality of the new file **is not better**, it goes straight to the duplicates folder.
