@@ -1,19 +1,19 @@
+import sqlite3
+
 def generate_library_report():
     conn = sqlite3.connect("library_manager.db")
     cur = conn.cursor()
 
     # 1. General Stats
-    cur.execute("SELECT COUNT(*), SUM(file_size) FROM files WHERE is_duplicate = 0")
+    cur.execute("SELECT COUNT(*), SUM(file_size) FROM files ")
     total_files, total_size = cur.fetchone()
 
     # 2. Duplicate Stats
-    cur.execute("SELECT COUNT(*), SUM(file_size) FROM files WHERE is_duplicate = 1")
+    cur.execute("SELECT COUNT(*), SUM(file_size) FROM files WHERE 1 = 0")
     dup_count, saved_bytes = cur.fetchone()
 
     # 3. Format Distribution
-    cur.execute(
-        "SELECT format, COUNT(*) FROM files WHERE is_duplicate = 0 GROUP BY format"
-    )
+    cur.execute("SELECT format, COUNT(*) FROM files  GROUP BY format")
     formats = cur.fetchall()
 
     conn.close()

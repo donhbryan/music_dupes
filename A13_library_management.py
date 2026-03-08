@@ -11,26 +11,30 @@ import mutagen
 import traceback
 from mutagen.id3 import ID3, TPE1, TPE2, TRCK, TPOS, TIT2, TALB
 from tqdm import tqdm
+import json
 
 
 class MusicLibraryManager:
-    def __init__(
-        self,
-        api_key,
-        music_folder,
-        destination_folder,
-        dup_folder,
-        unresolved_folder,
-        db_path="library.db",
-        dry_run=False,
-    ):
-        self.api_key = api_key
-        self.music_folder = os.path.abspath(music_folder)
-        self.destination_folder = os.path.abspath(destination_folder)
-        self.dup_folder = os.path.abspath(dup_folder)
-        self.unresolved_folder = os.path.abspath(unresolved_folder)
-        self.db_path = db_path
-        self.dry_run = dry_run
+
+    def __init__(self, config_file="config.json"):
+        # Load the configuration from the JSON file
+        try:
+            with open(config_file, "r") as f:
+                config = json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Configuration file not found: {config_file}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Error parsing JSON configuration: {e}")
+
+        # Map the JSON keys to class attributes with fallback defaults
+        self.api_key = config.get("api_key")
+        self.music_folder = os.path.abspath(config.get("music_folder", ""))
+        self.destination_folder = os.path.abspath(config.get("destination_folder", ""))
+        self.dup_folder = os.path.abspath(config.get("dup_folder", ""))
+        self.unresolved_folder = os.path.abspath(config.get("unresolved_folder", ""))
+        self.db_path = config.get("db_path", "library.db")
+        self.dry_run = config.get("dry_run", False)
+
         self.player_process = None
 
         # Tuning for fuzzy matching
@@ -490,11 +494,11 @@ class MusicLibraryManager:
                 end_idx = start_idx + page_size
                 current_batch = candidates[start_idx:end_idx]
 
-                print(f"\n[!] Ambiguous API Match for file: {filename}")
+                print(f"\n[!] Ambiguous API Match for file: {file_path}")
                 print(f"    Page {current_page + 1}/{total_pages}")
                 # Added 'Own' column header
                 print(
-                    f"{'#':<3} {'Own':<3} {'Sim':<5} {'Ctry':<4} {'Date':<6} {'Artist':<20} {'Album'}"
+                    f"{'#':<3} {'Own':<3} {'Sim':<5} {'Ctry':<4} {'Date':<6} {'Artist':<25} {'Album'}"
                 )
                 print("-" * 80)
 
@@ -506,7 +510,7 @@ class MusicLibraryManager:
                     own_mark = "*" if c.get("is_owned") else ""
 
                     print(
-                        f"{global_idx:<3} {own_mark:<3} {sim_pct:<5} {c['country']:<4} {c['date']:<6} {c['artist'][:19]:<20} {c['album_title']}"
+                        f"{global_idx:<3} {own_mark:<3} {sim_pct:<5} {c['country']:<4} {c['date']:<6} {c['artist'][:25]:<25} {c['album_title']}"
                     )
 
                 print("-" * 80)
@@ -1060,19 +1064,33 @@ class MusicLibraryManager:
     def __del__(self):
         self.close()
 
-
 if __name__ == "__main__":
-    CONFIG = {
-        "api_key": "7dlZplmc3N",
-        "music_folder": "/mnt/NAS/lost+found/",
-        "destination_folder": "/mnt/ssk/NewMaster",
-        "dup_folder": "/mnt/ssk/duplicates",
-        "unresolved_folder": "/mnt/ssk/unresolved",
-        "db_path": "library_manager.db",
-        "dry_run": False,
-    }
+    config_filename = "library_management_config.json"
 
-    manager = MusicLibraryManager(**CONFIG)
+    # Auto-generate a default config file if it doesn't exist
+    if not os.path.exists(config_filename):
+        print(
+            f"[{config_filename}] not found. Generating a default configuration file..."
+        )
+        default_config = {
+            "api_key": "7dlZplmc3N",
+            "music_folder": "/mnt/NAS/cleanmusic/music/",
+            "destination_folder": "/mnt/NAS/cleanmusic/NewMaster/",
+            "dup_folder": "/mnt/NAS/cleanmusic/duplicates/",
+            "unresolved_folder": "/mnt/NAS/cleanmusic/unresolved/",
+            "db_path": "library_manager.db",
+            "dry_run": False,
+        }
+        with open(config_filename, "w") as f:
+            json.dump(default_config, f, indent=4)
+
+        print(
+            f"Default configuration created! Please review '{config_filename}' and run the script again."
+        )
+        sys.exit(0)
+
+    # Initialize with the JSON file
+    manager = MusicLibraryManager(config_file=config_filename)
     try:
         manager.process_library()
     finally:
