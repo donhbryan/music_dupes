@@ -5,5 +5,8 @@
     "dup_folder": "/mnt/NAS/cleanmusic/duplicates/",
     "unresolved_folder": "/mnt/NAS/cleanmusic/unresolved/",
     "db_path": "library_manager.db",
-    "dry_run": false
+    "dry_run": false,
+    "prune": false,
+    "prepopulate": false,
+    "process": true
 }
