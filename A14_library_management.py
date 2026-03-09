@@ -94,6 +94,7 @@ class MusicLibraryManager:
                             quality_score REAL,
                             album_id TEXT,
                             processed INTEGER DEFAULT 0,
+                            date_modified DATETIME DEFAULT CURRENT_TIMESTAMP,
                             FOREIGN KEY (album_id) REFERENCES albums (release_id)
                         )"""
         )
@@ -101,6 +102,23 @@ class MusicLibraryManager:
             "CREATE INDEX IF NOT EXISTS idx_acoustid ON files(acoustid_id)"
         )
 
+        # --- NEW: Safe migration for existing databases ---
+        try:
+            self.cur.execute(
+                "ALTER TABLE files ADD COLUMN date_modified DATETIME DEFAULT CURRENT_TIMESTAMP"
+            )
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # --- NEW: Trigger to auto-update timestamp on modifications ---
+        self.cur.execute(
+            """CREATE TRIGGER IF NOT EXISTS update_files_modtime
+               AFTER UPDATE ON files
+               FOR EACH ROW
+               BEGIN
+                   UPDATE files SET date_modified = CURRENT_TIMESTAMP WHERE path = old.path;
+               END;"""
+        )
         # Fingerprint History
         self.cur.execute(
             """CREATE TABLE IF NOT EXISTS known_fingerprints (
@@ -703,7 +721,9 @@ class MusicLibraryManager:
             if dispose_source and not self.dry_run:
                 self._safe_move(path, self.dup_folder, operation="move")
                 self.cur.execute(
-                    "INSERT OR REPLACE INTO files (path, processed, acoustid_id, quality_score, format, file_size) VALUES (?, 1, ?, ?, ?, ?)",
+                    """INSERT OR REPLACE INTO files 
+                       (path, processed, acoustid_id, quality_score, format, file_size, date_modified) 
+                       VALUES (?, 1, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
                     (
                         path,
                         acoustid_id,
@@ -813,7 +833,7 @@ class MusicLibraryManager:
 
                     if not self.dry_run:
                         self.cur.execute(
-                            "INSERT OR REPLACE INTO files (path, processed) VALUES (?, 1)",
+                            "INSERT OR REPLACE INTO files (path, processed, date_modified) VALUES (?, 1, CURRENT_TIMESTAMP)",
                             (path,),
                         )
                         self.conn.commit()
@@ -1040,7 +1060,9 @@ class MusicLibraryManager:
                     )
 
                     self.cur.execute(
-                        "INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        """INSERT OR REPLACE INTO files 
+                           (path, fingerprint, acoustid_id, title, track_no, disc_no, format, file_size, quality_score, album_id, processed, date_modified) 
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?, CURRENT_TIMESTAMP)""",
                         (
                             final_path,
                             fingerprint,
@@ -1087,7 +1109,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "-c",
         "--config",
-        default="config.json",
+        default="library_management_config.json",
         help="Path to the JSON configuration file.",
     )
     parser.add_argument(

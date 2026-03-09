@@ -1,4 +1,5 @@
-How to use your new CLI toolkit
+## How to use your new CLI toolkit
+
 Now your script behaves like a standard command-line utility. Here are a few ways you can run it:
 
 Standard Run (Defaults to processing):
