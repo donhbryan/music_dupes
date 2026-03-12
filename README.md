@@ -1,8 +1,9 @@
+
 # AcoustID Music Library Manager & Deduplicator
 
 ---
 
-# current version A15
+# current version A16
 
 An intelligent, automated Python tool designed to sort, tag, organize, and deduplicate massive music libraries. Built for NAS environments and large messy collections, this script uses audio fingerprinting (AcoustID) and fast MD5 hashing to ensure your master library contains only the highest-quality version of every track, perfectly tagged and organized.
 
@@ -11,9 +12,10 @@ An intelligent, automated Python tool designed to sort, tag, organize, and dedup
 * **Audio Fingerprinting:** Uses AcoustID and MusicBrainz to identify tracks by their actual audio profile, ignoring incorrect or missing ID3 tags.
 * **Smart Quality Deduplication:** If duplicate tracks are found, the script calculates a "quality score" (based on lossless formats, bit depth, and file size) and strictly keeps the best version, moving the inferior file to a duplicates folder.
 * **Ultra-Fast Exact Matches:** Uses MD5 hashing to instantly detect exact file copies, bypassing slow API calls and audio decoding entirely.
+* **Prior Association Auto-Select:** If the database recognizes a file's audio fingerprint as belonging to an album you already have, it bypasses user prompts and automatically groups it with the existing album to evaluate for a quality upgrade.
+* **"Sticky" Album Context:** When resolving ambiguous new tracks, the script remembers the last selected album to intelligently group multi-track imports automatically.
 * **Automated Organization:** Renames and moves files into a clean `Artist/Album/Track - Title.ext` folder structure.
 * **Universal Auto-Tagging:** Automatically applies accurate metadata to MP3 (ID3), FLAC, M4A/MP4, WMA, and WAV files using `mutagen`.
-* **"Sticky" Album Context:** When resolving ambiguous tracks, the script remembers the last selected album to intelligently group multi-track imports automatically.
 * **Interactive CLI Audio Player:** If a track requires manual intervention, the script can play the audio file in the terminal using system audio players (`ffplay`, `mpv`, `cvlc`, or `afplay`) so you know exactly what you're sorting.
 * **Centralized JSON Configuration:** Easily manage all paths, API keys, and execution commands (like dry runs and database maintenance) from a single configuration file without touching the core Python code or passing complex CLI arguments. Includes safe parsing so `false`, `"false"`, or `"0"` are all handled correctly.
 * **Robust SQLite Tracking:** Maintains a local database of processed files, known fingerprints, and file hashes to speed up future runs and handle interruptions gracefully.
@@ -119,5 +121,5 @@ You can chain commands together. To clean up dead database links, update all fil
 ### 🧠 How Deduplication Works
 
 * **The Fast Pass (Exact Match):** The script reads the incoming file and generates an MD5 hash. If that hash already exists in the database, the file is instantly moved to the `dup_folder`. No API calls, no audio decoding.
-* **The Smart Pass (Audio Quality Match):** If the file is technically distinct (different bitrates, different encodings), it generates an AcoustID fingerprint. If the API confirms the song belongs to an Album you already have, the script calculates a quality score.
+* **The Smart Pass (Audio Quality Match):** If the file is technically distinct (different bitrates, different encodings), it generates an AcoustID fingerprint. The script first checks if this fingerprint is already associated with an album in your database. If it is, it auto-selects that album. If not, it uses sticky context or prompts you to select the correct album. Once an album is selected, it calculates a quality score.
 * **The Outcome:** The script strictly enforces quality. If the new file is better (e.g., FLAC replacing a 128kbps MP3), it upgrades your master library and sends the old file to the duplicates folder. If the quality of the new file **is not better**, it goes straight to the duplicates folder.

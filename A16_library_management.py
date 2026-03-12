@@ -518,35 +518,6 @@ class MusicLibraryManager:
             except sqlite3.Error as e:
                 logging.error(f"Error closing database: {e}")
 
-    def _prompt_dedup_resolution(
-        self, new_path, new_qual, old_path, old_qual, similarity
-    ):
-        print(f"\n[?] Uncertain Local Match ({similarity:.1%}) detected!")
-        print(
-            f"    NEW: {os.path.basename(new_path)} ({new_qual['format']}, {new_qual['size']//1024}KB)"
-        )
-        print(
-            f"    OLD: {os.path.basename(old_path)} ({old_qual['format']}, {old_qual['size']//1024}KB)"
-        )
-        print("    (Playing NEW file...)")
-        self._play_audio(new_path)
-
-        while True:
-            choice = input("    Keep (N)ew, (O)ld, (S)kip, or (Q)uit? ").lower()
-            if choice == "n":
-                self._stop_audio()
-                return "new"
-            elif choice == "o":
-                self._stop_audio()
-                return "old"
-            elif choice == "s":
-                self._stop_audio()
-                return "skip"
-            elif choice == "q":
-                self._stop_audio()
-                print("Exiting and rolling back current operation...")
-                return "quit"
-
     def _prompt_user_selection(self, file_path, candidates):
         filename = os.path.basename(file_path)
         page_size = 10
@@ -691,14 +662,6 @@ class MusicLibraryManager:
                 except OSError:
                     pass
 
-    def _handle_local_deduplication(self, path, fingerprint, quality):
-        match_path, match_score, match_record = self._find_local_fuzzy_match(
-            fingerprint
-        )
-        if not match_path or match_score < self.SIMILARITY_ASK:
-            return True
-        return True
-
     def _handle_album_deduplication(
         self, path, acoustid_id, release_id, quality, dispose_source=False
     ):
@@ -821,104 +784,118 @@ class MusicLibraryManager:
         print(f"Found {len(files)} supported files. Starting process...")
 
         for i, path in enumerate(files):
-            print(f"Processing [{i+1}/{len(files)}]: {os.path.basename(path)}")
+            print(f"\nProcessing [{i+1}/{len(files)}]: {os.path.basename(path)}")
+            self._process_single_file(path)
 
-            self.cur.execute("SELECT processed FROM files WHERE path = ?", (path,))
-            if (row := self.cur.fetchone()) and row[0] == 1:
-                print(" -> Already processed. Skipping.")
-                continue
+        self.cleanup_empty_folders()
 
-            # ==========================================
-            # FAST EXACT DUPLICATE CHECK
-            # ==========================================
-            file_hash = self._get_file_hash(path)
-            if file_hash:
-                self.cur.execute(
-                    "SELECT path FROM file_hashes WHERE file_hash = ?", (file_hash,)
-                )
-                if dup_row := self.cur.fetchone():
-                    existing_path = dup_row[0]
-                    print(f" -> Exact binary duplicate of a known file. Skipping API.")
-                    print(f"    (Matches: {os.path.basename(existing_path)})")
+    def _process_single_file(self, path):
+        """Handles the core processing flow for a single file."""
+        self.cur.execute("SELECT processed FROM files WHERE path = ?", (path,))
+        if (row := self.cur.fetchone()) and row[0] == 1:
+            print(" -> Already processed. Skipping.")
+            return
 
-                    self._safe_move(path, self.dup_folder, operation="move")
+        # ==========================================
+        # FAST EXACT DUPLICATE CHECK
+        # ==========================================
+        file_hash = self._get_file_hash(path)
+        if file_hash:
+            self.cur.execute(
+                "SELECT path FROM file_hashes WHERE file_hash = ?", (file_hash,)
+            )
+            if dup_row := self.cur.fetchone():
+                existing_path = dup_row[0]
+                print(f" -> Exact binary duplicate of a known file. Skipping API.")
+                print(f"    (Matches: {os.path.basename(existing_path)})")
 
-                    if not self.dry_run:
-                        self.cur.execute(
-                            "INSERT OR REPLACE INTO files (path, processed, date_modified) VALUES (?, 1, CURRENT_TIMESTAMP)",
-                            (path,),
-                        )
-                        self.conn.commit()
-                    else:
-                        print(
-                            f" -> [DRY RUN] Would update database to mark as processed duplicate."
-                        )
+                self._safe_move(path, self.dup_folder, operation="move")
 
-                    continue
-            # ==========================================
-
-            try:
-                if os.path.getsize(path) == 0:
-                    logging.warning(f"Skipping empty file: {path}")
-                    continue
-            except OSError:
-                logging.warning(f"Skipping inaccessible file: {path}")
-                continue
-
-            try:
-                try:
-                    duration, fingerprint = acoustid.fingerprint_file(path)
-                except (EOFError, OSError, acoustid.FingerprintGenerationError) as e:
-                    logging.warning(
-                        f"Skipping corrupt or unreadable audio file {path}: {e}"
+                if not self.dry_run:
+                    self.cur.execute(
+                        "INSERT OR REPLACE INTO files (path, processed, date_modified) VALUES (?, 1, CURRENT_TIMESTAMP)",
+                        (path,),
                     )
-                    continue
+                    self.conn.commit()
+                else:
+                    print(
+                        f" -> [DRY RUN] Would update database to mark as processed duplicate."
+                    )
+                return
+        # ==========================================
 
-                quality = self._calculate_quality(path)
-                if not quality:
-                    continue
+        try:
+            if os.path.getsize(path) == 0:
+                logging.warning(f"Skipping empty file: {path}")
+                return
+        except OSError:
+            logging.warning(f"Skipping inaccessible file: {path}")
+            return
 
-                resp = acoustid.lookup(
-                    self.api_key,
-                    fingerprint,
-                    duration,
-                    meta="recordings releases tracks",
-                )
-                if resp.get("status") != "ok" or not resp.get("results"):
-                    logging.warning(f"No match for {path}")
-                    print(f" -> No match found. Moving to unresolved.")
-                    self._safe_move(path, self.unresolved_folder, operation="move")
-                    continue
+        try:
+            try:
+                duration, fingerprint = acoustid.fingerprint_file(path)
+            except (EOFError, OSError, acoustid.FingerprintGenerationError) as e:
+                logging.warning(f"Skipping corrupt or unreadable audio file {path}: {e}")
+                return
 
-                candidates = self._get_candidates(resp["results"])
+            quality = self._calculate_quality(path)
+            if not quality:
+                return
 
-                if not candidates:
-                    logging.warning(f"No valid candidates parsed for {path}")
-                    print(f" -> No candidates. Moving to unresolved.")
-                    self._safe_move(path, self.unresolved_folder, operation="move")
-                    continue
+            resp = acoustid.lookup(
+                self.api_key,
+                fingerprint,
+                duration,
+                meta="recordings releases tracks",
+            )
+            
+            if resp.get("status") != "ok" or not resp.get("results"):
+                logging.warning(f"No match for {path}")
+                print(f" -> No match found. Moving to unresolved.")
+                self._safe_move(path, self.unresolved_folder, operation="move")
+                return
 
-                top_match = candidates[0]
-                current_acoustid_id = resp["results"][0]["id"]
+            candidates = self._get_candidates(resp["results"])
 
-                self._update_fingerprint_cache(current_acoustid_id, fingerprint)
+            if not candidates:
+                logging.warning(f"No valid candidates parsed for {path}")
+                print(f" -> No candidates. Moving to unresolved.")
+                self._safe_move(path, self.unresolved_folder, operation="move")
+                return
 
-                owned_ids = self._get_owned_release_ids(current_acoustid_id)
-                for c in candidates:
-                    c["is_owned"] = c["release"]["id"] in owned_ids
+            top_match = candidates[0]
+            current_acoustid_id = resp["results"][0]["id"]
 
-                candidates.sort(
-                    key=lambda x: (
-                        x["is_owned"],
-                        x["similarity"],
-                        x["country"] == "US",
-                        x["date"],
-                    ),
-                    reverse=True,
-                )
+            self._update_fingerprint_cache(current_acoustid_id, fingerprint)
 
-                top_match = candidates[0]
-                selected_matches = []
+            owned_ids = self._get_owned_release_ids(current_acoustid_id)
+            for c in candidates:
+                c["is_owned"] = c["release"]["id"] in owned_ids
+
+            candidates.sort(
+                key=lambda x: (
+                    x["is_owned"],
+                    x["similarity"],
+                    x["country"] == "US",
+                    x["date"],
+                ),
+                reverse=True,
+            )
+
+            top_match = candidates[0]
+            selected_matches = []
+            
+            # --- NEW FEATURE: Prior Associations Filter ---
+            # If the database already knows about this file in specific albums, 
+            # bypass prompts and auto-select those albums to run the quality upgrade check.
+            owned_candidates = [c for c in candidates if c.get("is_owned")]
+
+            if owned_candidates:
+                print(f" -> Found prior associations. Auto-selecting {len(owned_candidates)} existing album(s).")
+                selected_matches = owned_candidates
+            else:
+                # Fallback to Sticky Matching / Strict API Auto-Select / Manual Prompt
                 sticky_match = None
 
                 if self.last_selected_album_id:
@@ -931,9 +908,7 @@ class MusicLibraryManager:
                             break
 
                 if sticky_match:
-                    logging.info(
-                        f"Auto-selected sticky album: {sticky_match['album_title']}"
-                    )
+                    logging.info(f"Auto-selected sticky album: {sticky_match['album_title']}")
                     selected_matches = [sticky_match]
                 elif len(candidates) == 1 and top_match["similarity"] >= 0.98:
                     selected_matches = [top_match]
@@ -947,168 +922,173 @@ class MusicLibraryManager:
                     selected_matches = result or []
 
                     if len(selected_matches) == 1:
-                        self.last_selected_album_id = selected_matches[0]["release"][
-                            "id"
-                        ]
+                        self.last_selected_album_id = selected_matches[0]["release"]["id"]
                     else:
                         self.last_selected_album_id = None
 
-                if not selected_matches:
-                    logging.info(f"Skipped by user: {path}")
-                    continue
+            if not selected_matches:
+                logging.info(f"Skipped by user: {path}")
+                return
 
-                for idx, selected_match in enumerate(selected_matches):
-                    is_last_item = idx == len(selected_matches) - 1
-                    rel = selected_match["release"]
-                    rec = selected_match["recording"]
-                    target_recording_id = rec.get("id")
-                    target_release_id = rel.get("id")
+            # Process the selected albums
+            for idx, selected_match in enumerate(selected_matches):
+                is_last_item = idx == len(selected_matches) - 1
+                self._process_match_for_file(
+                    path, 
+                    current_acoustid_id, 
+                    fingerprint, 
+                    quality, 
+                    file_hash, 
+                    selected_match, 
+                    is_last_item
+                )
 
-                    if not self._handle_album_deduplication(
-                        path,
-                        current_acoustid_id,
-                        target_release_id,
-                        quality,
-                        dispose_source=is_last_item,
-                    ):
-                        continue
+        except Exception as e:
+            logging.error(f"Critical Failure on {path}: {e}")
+            logging.error(traceback.format_exc())
+            print(f" -> Error: {e}")
 
-                    artist = (
-                        rel.get("artists", [{}])[0].get("name")
-                        or rec.get("artists", [{}])[0].get("name")
-                        or "Unknown"
-                    )
+    def _process_match_for_file(
+        self, 
+        path, 
+        current_acoustid_id, 
+        fingerprint, 
+        quality, 
+        file_hash, 
+        selected_match, 
+        is_last_item
+    ):
+        """Handles deduplication logic, tagging, and saving for a selected match."""
+        rel = selected_match["release"]
+        rec = selected_match["recording"]
+        target_recording_id = rec.get("id")
+        target_release_id = rel.get("id")
 
-                    track_num = 1
-                    disc_num = 1
-                    found_track = False
+        if not self._handle_album_deduplication(
+            path,
+            current_acoustid_id,
+            target_release_id,
+            quality,
+            dispose_source=is_last_item,
+        ):
+            return
 
-                    def norm(s):
-                        return str(s).lower().strip()
+        artist = (
+            rel.get("artists", [{}])[0].get("name")
+            or rec.get("artists", [{}])[0].get("name")
+            or "Unknown"
+        )
 
-                    target_title = norm(rec.get("title", ""))
+        track_num = 1
+        disc_num = 1
+        found_track = False
 
-                    for medium in rel.get("mediums", []):
-                        current_disc = medium.get("position", 1)
-                        for track in medium.get("tracks", []):
-                            track_rec_id = str(track.get("recording", {}).get("id"))
-                            if track_rec_id == str(target_recording_id):
-                                track_num = track.get("position", 1)
-                                disc_num = current_disc
-                                found_track = True
-                                break
-                        if found_track:
-                            break
+        def norm(s):
+            return str(s).lower().strip()
 
-                    if not found_track:
-                        logging.warning(
-                            f"Exact ID match failed for {path}. Attempting Title match fallback."
-                        )
-                        for medium in rel.get("mediums", []):
-                            current_disc = medium.get("position", 1)
-                            for track in medium.get("tracks", []):
-                                if norm(track.get("title", "")) == target_title:
-                                    track_num = track.get("position", 1)
-                                    disc_num = current_disc
-                                    found_track = True
-                                    break
-                            if found_track:
-                                break
+        target_title = norm(rec.get("title", ""))
 
-                    if not found_track:
-                        logging.warning(
-                            f"Could not find track number for {path}. Defaulting to 1."
-                        )
+        for medium in rel.get("mediums", []):
+            current_disc = medium.get("position", 1)
+            for track in medium.get("tracks", []):
+                track_rec_id = str(track.get("recording", {}).get("id"))
+                if track_rec_id == str(target_recording_id):
+                    track_num = track.get("position", 1)
+                    disc_num = current_disc
+                    found_track = True
+                    break
+            if found_track:
+                break
 
-                    meta = {
-                        "title": rec.get("title", "Unknown"),
-                        "album": rel.get("title", "Unknown Album"),
-                        "artist": artist,
-                        "album_artist": rel.get("artists", [{}])[0].get("name")
-                        or artist,
-                        "track_no": track_num,
-                        "disc_no": disc_num,
-                        "release_date": str(rel.get("date", {}).get("year", "0000")),
-                        "release_id": target_release_id,
-                    }
+        if not found_track:
+            logging.warning(
+                f"Exact ID match failed for {path}. Attempting Title match fallback."
+            )
+            for medium in rel.get("mediums", []):
+                current_disc = medium.get("position", 1)
+                for track in medium.get("tracks", []):
+                    if norm(track.get("title", "")) == target_title:
+                        track_num = track.get("position", 1)
+                        disc_num = current_disc
+                        found_track = True
+                        break
+                if found_track:
+                    break
 
-                    safe_artist = self._sanitize_name(meta["album_artist"])
-                    safe_album = self._sanitize_name(meta["album"])
-                    raw_filename = f"{str(meta['track_no']).zfill(2)} - {meta['title']}{quality['format']}"
-                    safe_filename = self._sanitize_name(raw_filename)
+        if not found_track:
+            logging.warning(f"Could not find track number for {path}. Defaulting to 1.")
 
-                    final_path = None
-                    if is_last_item:
-                        final_path = self._organize_file(
-                            path,
-                            safe_artist,
-                            safe_album,
-                            safe_filename,
-                            operation="move",
-                        )
-                    else:
-                        final_path = self._organize_file(
-                            path,
-                            safe_artist,
-                            safe_album,
-                            safe_filename,
-                            operation="copy",
-                        )
+        meta = {
+            "title": rec.get("title", "Unknown"),
+            "album": rel.get("title", "Unknown Album"),
+            "artist": artist,
+            "album_artist": rel.get("artists", [{}])[0].get("name") or artist,
+            "track_no": track_num,
+            "disc_no": disc_num,
+            "release_date": str(rel.get("date", {}).get("year", "0000")),
+            "release_id": target_release_id,
+        }
 
-                    if not final_path:
-                        continue
+        safe_artist = self._sanitize_name(meta["album_artist"])
+        safe_album = self._sanitize_name(meta["album"])
+        raw_filename = f"{str(meta['track_no']).zfill(2)} - {meta['title']}{quality['format']}"
+        safe_filename = self._sanitize_name(raw_filename)
 
-                    self._apply_tags(final_path, meta)
+        final_path = None
+        if is_last_item:
+            final_path = self._organize_file(
+                path, safe_artist, safe_album, safe_filename, operation="move"
+            )
+        else:
+            final_path = self._organize_file(
+                path, safe_artist, safe_album, safe_filename, operation="copy"
+            )
 
-                    self.cur.execute(
-                        "INSERT OR IGNORE INTO albums VALUES (?,?,?,?,?)",
-                        (
-                            meta["release_id"],
-                            meta["album"],
-                            meta["album_artist"],
-                            meta["release_date"],
-                            rel.get("country", "XX"),
-                        ),
-                    )
+        if not final_path:
+            return
 
-                    self.cur.execute(
-                        """INSERT OR REPLACE INTO files 
-                           (path, fingerprint, acoustid_id, title, track_no, disc_no, format, file_size, quality_score, album_id, processed, date_modified) 
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?, CURRENT_TIMESTAMP)""",
-                        (
-                            final_path,
-                            fingerprint,
-                            current_acoustid_id,
-                            meta["title"],
-                            meta["track_no"],
-                            meta["disc_no"],
-                            quality["format"],
-                            quality["size"],
-                            quality["score"],
-                            meta["release_id"],
-                            1,
-                        ),
-                    )
+        self._apply_tags(final_path, meta)
 
-                    self._update_index(final_path, fingerprint)
+        self.cur.execute(
+            "INSERT OR IGNORE INTO albums VALUES (?,?,?,?,?)",
+            (
+                meta["release_id"],
+                meta["album"],
+                meta["album_artist"],
+                meta["release_date"],
+                rel.get("country", "XX"),
+            ),
+        )
 
-                    if file_hash:
-                        self.cur.execute(
-                            "INSERT OR REPLACE INTO file_hashes (file_hash, path) VALUES (?, ?)",
-                            (file_hash, final_path),
-                        )
+        self.cur.execute(
+            """INSERT OR REPLACE INTO files 
+               (path, fingerprint, acoustid_id, title, track_no, disc_no, format, file_size, quality_score, album_id, processed, date_modified) 
+               VALUES (?,?,?,?,?,?,?,?,?,?,?, CURRENT_TIMESTAMP)""",
+            (
+                final_path,
+                fingerprint,
+                current_acoustid_id,
+                meta["title"],
+                meta["track_no"],
+                meta["disc_no"],
+                quality["format"],
+                quality["size"],
+                quality["score"],
+                meta["release_id"],
+                1,
+            ),
+        )
 
-                    self.conn.commit()
-                    print(
-                        f" -> Success: {os.path.join(safe_artist, safe_album, safe_filename)}"
-                    )
+        self._update_index(final_path, fingerprint)
 
-            except Exception as e:
-                logging.error(f"Critical Failure on {path}: {e}")
-                logging.error(traceback.format_exc())
-                print(f" -> Error: {e}")
+        if file_hash:
+            self.cur.execute(
+                "INSERT OR REPLACE INTO file_hashes (file_hash, path) VALUES (?, ?)",
+                (file_hash, final_path),
+            )
 
-        self.cleanup_empty_folders()
+        self.conn.commit()
+        print(f" -> Success: {os.path.join(safe_artist, safe_album, safe_filename)}")
 
     def __del__(self):
         self.close()
