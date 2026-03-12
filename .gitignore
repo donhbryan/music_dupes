@@ -3,16 +3,17 @@ __pycache__/
 *.pyc
 data/
 bin/
+SQL/
+oldCode/
 
-*.wav
 .DS_Store
 .idea/
 .vscode/
-*.log
- *.db
 .env
 
-*wav
+*.log
+*.db
+*.wav
 *.mp3
 *.flac
 *.m4a
