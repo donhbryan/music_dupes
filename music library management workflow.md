@@ -1,0 +1,62 @@
+# Library Management Workflow
+
+In the music library management workflow, files are usually routed to the master directory, the duplicates folder, or the unresolved folder. However, there are several specific conditions where an audio file will be completely bypassed and left untouched in its original source directory:
+
+1. "Dry Run" Mode is Active
+If "dry_run": true is set in the configuration JSON, the script simulates the entire fingerprinting, database, and deduplication logic, but explicitly bypasses all physical file operations (shutil.move and shutil.copy2). No files are actually moved.
+
+2. Unsupported File Extensions
+The script's main os.walk loop filters strictly for supported formats. Any file that does not end with .mp3, .flac, .m4a, .mp4, .wma, or .wav (such as .ogg, .ape, .jpg cover art, or .txt logs) is completely ignored by the scanner.
+
+3. The File is "Already Processed"
+At the very beginning of the per-file loop, the script queries the database for the exact file path. If the database returns processed = 1 for that path, the script assumes the file was handled in a previous run and instantly skips it.
+
+4. Zero-Byte or Inaccessible Files
+Before any fingerprinting begins, the script checks the file size using os.path.getsize(path).
+
+     If the file is exactly 0 bytes (an empty shell file), it logs a warning and skips it.
+
+     If the operating system throws a permission error (e.g., the file is locked by another program or owned by a restricted user), it logs an inaccessible warning and skips it.
+
+5. Mutagen Parsing Failure (Pre-API)
+If the mutagen library completely fails to read the file's audio headers to generate the bit-depth/sample-rate quality score, the _calculate_quality function returns None. Because this happens before the AcoustID API lookup or the C++ crash handler, the script aborts the loop early and leaves the file in the source directory rather than moving it to unresolved.
+
+6. Manual User Skip
+When the AcoustID API returns ambiguous album matches, the script pauses and prompts the user for a selection in the CLI. If the user inputs 0 (Skip) or q (Quit), the script honors the skip and abandons the file, leaving it exactly where it is.
+
+7. OS-Level Transfer Failures
+If a file successfully makes it through all logic checks, but the final _safe_move operation fails (e.g., the destination drive runs out of storage space, or a read-only permission blocks the transfer), the exception is caught, logged, and the original file remains in the source directory.
+
+# Global Deduplcation  
+
+In your MusicLibraryManager script, global_dedup is a configuration setting that determines how strictly the script searches for and removes duplicate songs in your library.
+
+It changes the boundary of the deduplication check in the **_handle_album_deduplication** function. Here is how the two modes work:
+
+1. When "**global_dedup**": false (Per-Album Deduplication)
+This is the default behavior. When set to false, the script will only look for duplicates of a song within the exact same album.
+
+How it works: It queries the database using both the acoustid_id (the song's fingerprint) AND the album_id.
+
+## Example
+
+If you have the song "Under Pressure" saved under Queen's original studio album Hot Space, and you also have a copy of "Under Pressure" saved under the compilation album Greatest Hits III, the script will keep both files. It views them as two distinct entities because their Album IDs do not match.
+
+### Best for
+
+People who want to maintain complete, intact albums. If you play an album from start to finish, you want every track to be there.
+
+1. When "**global_dedup**": true (Library-Wide Deduplication)
+When set to true, the script completely ignores album boundaries. It enforces a strict rule: There can only be one copy of a song in the entire master library.
+
+How it works: It queries the database using only the acoustid_id.
+
+Example: Using the "Under Pressure" example above, the script will notice that you have two copies of the same song in your library. It will then compare their quality scores. If the Hot Space version is a 320kbps MP3 and the Greatest Hits III version is a Lossless FLAC, the script will keep the FLAC version, update its tags, and throw the MP3 into your duplicates folder.
+
+### Best for
+
+People who listen to music primarily via shuffled playlists or single tracks and want to save as much hard drive space as possible by ruthlessly purging identical audio.
+
+### The Drawback of global_dedup
+
+If you turn this feature on, you will save a lot of disk space, but you will "break" compilation and greatest hits albums. If you try to listen to a Greatest Hits album straight through, it will be missing several tracks because the script determined the highest-quality master versions of those songs actually belonged to their original studio albums, and it deleted the duplicate copies from the Greatest Hits folder.

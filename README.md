@@ -1,125 +1,281 @@
+# Music Library Manager
 
-# AcoustID Music Library Manager & Deduplicator
+An automated, high-performance music library organizer and deduplicator. This tool scans a raw music folder, identifies tracks using exact audio hashing and AcoustID audio fingerprinting, standardizes metadata via the MusicBrainz API, and safely organizes files into a clean `Artist / Album / Track - Title` directory structure.
 
----
+## 🌟 Key Features
 
-# current version A16
+* **Intelligent Deduplication:** Uses 30-second audio snippet hashing (`ffmpeg`) to quickly identify exact audio matches without relying on brittle metadata or full-file processing.
+* **Quality-Based Upgrades:** Automatically evaluates duplicates and retains the highest quality file. It strictly prioritizes metadata-friendly lossless formats (FLAC > ALAC > WAV > MP3 > WMA) and gracefully moves inferior duplicates to a designated folder.
+* **AcoustID Fingerprinting:** Uses Chromaprint to identify songs even if they have no tags or incorrect filenames.
+* **Crash Resilience:** Audio fingerprinting is isolated in a separate multiprocessing worker (`fork`/`spawn`). If a severely corrupted audio file causes the underlying C++ library to crash, the main script safely catches it, moves the file to an `unresolved` folder, and continues processing.
+* **Interactive Ambiguity Resolution:** If the API returns multiple highly probable album matches, the script attempts to auto-select based on prior library associations. If still ambiguous, it plays the audio clip (via `ffplay`, `afplay`, `mpv`, or `cvlc`) and prompts the user to select the correct album.
+* **Automated Tagging:** Applies standardized ID3, Vorbis, and MP4 tags (Title, Artist, Album, Album Artist, Track No, Disc No) using the `mutagen` library.
+* **High-Performance Database:** Uses an optimized SQLite3 database with Write-Ahead Logging (WAL) to track known fingerprints, audio blocks, and file histories, drastically speeding up subsequent runs.
 
-An intelligent, automated Python tool designed to sort, tag, organize, and deduplicate massive music libraries. Built for NAS environments and large messy collections, this script uses audio fingerprinting (AcoustID) and fast MD5 hashing to ensure your master library contains only the highest-quality version of every track, perfectly tagged and organized.
+## 📋 Prerequisites
 
-## ✨ Key Features
+Ensure you have the following system dependencies installed before running the script:
 
-* **Audio Fingerprinting:** Uses AcoustID and MusicBrainz to identify tracks by their actual audio profile, ignoring incorrect or missing ID3 tags.
-* **Smart Quality Deduplication:** If duplicate tracks are found, the script calculates a "quality score" (based on lossless formats, bit depth, and file size) and strictly keeps the best version, moving the inferior file to a duplicates folder.
-* **Ultra-Fast Exact Matches:** Uses MD5 hashing to instantly detect exact file copies, bypassing slow API calls and audio decoding entirely.
-* **Prior Association Auto-Select:** If the database recognizes a file's audio fingerprint as belonging to an album you already have, it bypasses user prompts and automatically groups it with the existing album to evaluate for a quality upgrade.
-* **"Sticky" Album Context:** When resolving ambiguous new tracks, the script remembers the last selected album to intelligently group multi-track imports automatically.
-* **Automated Organization:** Renames and moves files into a clean `Artist/Album/Track - Title.ext` folder structure.
-* **Universal Auto-Tagging:** Automatically applies accurate metadata to MP3 (ID3), FLAC, M4A/MP4, WMA, and WAV files using `mutagen`.
-* **Interactive CLI Audio Player:** If a track requires manual intervention, the script can play the audio file in the terminal using system audio players (`ffplay`, `mpv`, `cvlc`, or `afplay`) so you know exactly what you're sorting.
-* **Centralized JSON Configuration:** Easily manage all paths, API keys, and execution commands (like dry runs and database maintenance) from a single configuration file without touching the core Python code or passing complex CLI arguments. Includes safe parsing so `false`, `"false"`, or `"0"` are all handled correctly.
-* **Robust SQLite Tracking:** Maintains a local database of processed files, known fingerprints, and file hashes to speed up future runs and handle interruptions gracefully.
-* **Modification Tracking:** The database automatically generates and updates a `date_modified` timestamp for every file record using built-in SQLite triggers.
+* **Python 3.8+**
+* **FFmpeg:** Required for high-speed audio snippet extraction.
+  * *Ubuntu/Debian:* `sudo apt install ffmpeg`
+  * *macOS:* `brew install ffmpeg`
+  * *Windows:* Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH.
+* **Chromaprint / fpcalc:** Required by the `acoustid` library for fingerprinting.
+  * *Ubuntu/Debian:* `sudo apt install libchromaprint-tools`
+  * *macOS:* `brew install chromaprint`
+* **CLI Audio Player (Optional but Recommended):** For interactive match resolution. The script looks for `afplay` (macOS default), `ffplay`, `mpv`, or `cvlc`.
 
-### 🛠️ Prerequisites
+## 🚀 Installation
 
-**Python Dependencies**
-You will need Python 3.8+ and the following libraries:
+Clone this repository or download the script to your local machine.
+
+Next, install the required Python packages by running the following command in your terminal:
 
 ```bash
 pip install pyacoustid mutagen tqdm
 ```
 
-**System Dependencies**
-For AcoustID fingerprinting to work, you must have the `fpcalc` utility installed on your system.
+## ⚙️ Configuration
 
-* **Debian/Ubuntu/Linux Mint:** `sudo apt install fpcalc`
-* **macOS:** `brew install chromaprint`
-
-For the terminal audio preview feature to work during ambiguous matches, ensure you have at least one of these CLI players installed: `ffplay` (part of ffmpeg), `mpv`, or `vlc`.
-
-**API Key**
-You will need a free AcoustID API key. Register an application at [acoustid.org](https://acoustid.org/) to get one.
-
-### ⚙️ Configuration
-
-On the first run, the script will automatically generate a `library_management_config.json` file in the same directory. Edit this file with your specific paths, API key, and desired execution flags:
+On the first run, the script will automatically generate a `library_management_config.json` file in the root directory. Edit this file to match your environment:
 
 ```json
 {
     "api_key": "YOUR_ACOUSTID_API_KEY",
-    "music_folder": "/MUSIC_SOURCE_FOLDER/",
-    "destination_folder": "/TARGET_FOLDER_WITH_BEST_QUALITY/",
-    "dup_folder": "/FOLDER_FOR_DUPLICATES/",
-    "unresolved_folder": "/FOLDER_FOR_UNPROCESSED_FILES/",
+    "music_folder": "/path/to/raw/music/",
+    "destination_folder": "/path/to/organized/master/",
+    "dup_folder": "/path/to/duplicates/",
+    "unresolved_folder": "/path/to/unresolved/",
     "db_path": "library_manager.db",
     "dry_run": false,
     "prune": false,
-    "prepopulate": false,
+    "hashAudio": false,
+    "global_dedup": false,
     "process": true
 }
 ```
 
-* **music_folder:** Where your unsorted, messy music is located.
-* **destination_folder:** Where your organized, tagged master library will be built.
-* **dup_folder:** Where lower-quality duplicates and exact copies are sent.
-* **unresolved_folder:** Where files with no AcoustID match are safely moved.
+### Configuration Options
 
-## 🚀 Usage & Execution Modes
+**api_key:** Your personal AcoustID API key (get one at acoustid.org).
 
-Because the script manages large libraries, all operational commands are managed safely via the JSON configuration file. To run the script, simply execute it in your terminal:
+**music_folder:** The source directory containing your unorganized audio files.
 
-```bash
+**destination_folder:** Where successfully tagged and organized files will be placed.
+
+**dup_folder:** Where lower-quality exact duplicates are moved.
+
+**unresolved_folder:** Where corrupt, unreadable, or completely unmatched files are moved.
+
+**dry_run:** Set to true to simulate the process without actually moving or modifying any files.
+
+**prune:** Set to true to clean the database of records for files that have been deleted from your drive.
+
+**hashAudio:** Set to true to retroactively generate 30-second audio hashes for files already in your database. (Useful after a major script update).
+
+**global_dedup:** Set to true to purge identical audio across your entire library. If false, deduplication only happens within the context of the same Album ID.
+
+**process:** Set to true to run the main library organization workflow.
+
+## 💻 Usage
+
+Once your configuration file is set, simply run the script:
+
+```Bash
 python library_management.py
 ```
 
-The script will look at the true/false flags at the bottom of your `library_management_config.json` file to determine what actions to take. You can toggle multiple flags on at the same time to chain operations.
+### Maintenance Workflows
 
-#### Basic Processing
+1. Database Cleanup (Pruning):  
+If you manually delete files from your library and want to remove their ghost entries from the database:
 
-To process your incoming `music_folder` and organize it into your `destination_folder`, ensure your config is set to:
+   1. Edit library_management_config.json:  
+ set "prune": true and "process": false.
+
+1. Retroactive Audio Hashing:
+If you need to generate fast-match audio hashes for an existing database:
+
+    Edit library_management_config.json: set "hashAudio": true and "process": false.
+
+## Run the script
+
+### 🧠 How the Deduplication Hierarchy Works
+
+When the script evaluates two copies of the same song, it assigns a quality score based on the following format hierarchy, using file size and bit-depth only as tie-breakers:
+
+**FLAC** (Lossless + Robust Metadata)
+
+**M4A / ALAC** (Lossless + Robust Metadata)
+
+**WAV** (Lossless + Poor Metadata Support)
+
+**MP3** (Lossy)
+
+**WMA** (Lossy)
+
+If a new file has a higher score than the existing file in your database, the old file is evicted to the duplicates folder, and the new superior file takes its place in the master library.
+
+# Music Library Manager
+
+An automated, high-performance music library organizer and deduplicator. This tool scans a raw music folder, identifies tracks using exact audio hashing and AcoustID audio fingerprinting, standardizes metadata via the MusicBrainz API, and safely organizes files into a clean **Artist / Album / Track - Title** directory structure.
+
+## 🌟 Key Features
+
+* **Intelligent Deduplication:** Uses 30-second audio snippet hashing (`ffmpeg`) to quickly identify exact audio matches without relying on brittle metadata or full-file processing.
+* **Quality-Based Upgrades:** Automatically evaluates duplicates and retains the highest quality file. It strictly prioritizes metadata-friendly lossless formats (FLAC > ALAC > WAV > MP3 > WMA) and gracefully moves inferior duplicates to a designated folder.
+* **AcoustID Fingerprinting:** Uses Chromaprint to identify songs even if they have no tags or incorrect filenames.
+* **Crash Resilience:** Audio fingerprinting is isolated in a separate multiprocessing worker (`fork`/`spawn`). If a severely corrupted audio file causes the underlying C++ library to crash, the main script safely catches it, moves the file to an `unresolved` folder, and continues processing.
+* **Interactive Ambiguity Resolution:** If the API returns multiple highly probable album matches, the script attempts to auto-select based on prior library associations. If still ambiguous, it plays the audio clip (via `ffplay`, `afplay`, `mpv`, or `cvlc`) and prompts the user to select the correct album.
+* **Automated Tagging:** Applies standardized ID3, Vorbis, and MP4 tags (Title, Artist, Album, Album Artist, Track No, Disc No) using the `mutagen` library.
+* **High-Performance Database:** Uses an optimized SQLite3 database with Write-Ahead Logging (WAL) to track known fingerprints, audio blocks, and file histories, drastically speeding up subsequent runs.
+
+## 📋 Prerequisites
+
+Ensure you have the following system dependencies installed before running the script:
+
+* **Python 3.8+**
+* **FFmpeg:** Required for high-speed audio snippet extraction.
+  * *Ubuntu/Debian:* `sudo apt install ffmpeg`
+  * *macOS:* `brew install ffmpeg`
+  * *Windows:* Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH.
+* **Chromaprint / fpcalc:** Required by the `acoustid` library for fingerprinting.
+  * *Ubuntu/Debian:* `sudo apt install libchromaprint-tools`
+  * *macOS:* `brew install chromaprint`
+* **CLI Audio Player (Optional but Recommended):** For interactive match resolution. The script looks for `afplay` (macOS default), `ffplay`, `mpv`, or `cvlc`.
+
+## 🚀 Installation
+
+Clone this repository or download the script to your local machine.
+
+Next, install the required Python packages by running the following command in your terminal:
+
+```bash
+pip install pyacoustid mutagen tqdm
+```
+
+## ⚙️ Configuration
+
+On the first run, the script will automatically generate a `library_management_config.json` file in the root directory. Edit this file to match your environment:
 
 ```json
+{
+    "api_key": "YOUR_ACOUSTID_API_KEY",
+    "music_folder": "/path/to/raw/music/",
+    "destination_folder": "/path/to/organized/master/",
+    "dup_folder": "/path/to/duplicates/",
+    "unresolved_folder": "/path/to/unresolved/",
+    "db_path": "library_manager.db",
+    "dry_run": false,
+    "prune": false,
+    "hashAudio": false,
+    "global_dedup": false,
     "process": true
+}
 ```
 
-#### Safe Testing (Dry Run)
+## Configuration Options
 
-Want to see what the script *would* do without actually moving files or updating the database? Set the dry run flag:
+**api_key:** Your personal AcoustID API key (get one at acoustid.org).
 
-```json
-    "dry_run": true
+**music_folder:** The source directory containing your unorganized audio files.
+
+**destination_folder:** Where successfully tagged and organized files will be placed.
+
+**dup_folder:** Where lower-quality exact duplicates are moved.
+
+**unresolved_folder:** Where corrupt, unreadable, or completely unmatched files are moved.
+
+**dry_run:** Set to true to simulate the process without actually moving or modifying any files.
+
+**prune:** Set to true to clean the database of records for files that have been deleted from your drive.
+
+**hashAudio:** Set to true to retroactively generate 30-second audio hashes for files already in your database. (Useful after a major script update).
+
+**global_dedup:** Set to true to purge identical audio across your entire library. If false, deduplication only happens within the context of the same Album ID.
+
+**process:** Set to true to run the main library organization workflow.
+
+## 💻 Usage
+
+Once your configuration file is set, simply run the script:
+
+```Bash
+python library_management.py
 ```
 
-#### 🧽 Database Maintenance Options
+Maintenance Workflows
 
-Because the script uses a local SQLite database to track processed files and hashes, you may occasionally need to perform maintenance—especially if you delete or manually move files in your `destination_folder` outside of the script.
+1. Database Cleanup (Pruning):
+If you manually delete files from your library and want to remove their ghost entries from the database:
 
-**1. Prune Ghost Entries**
-If you manually delete files from your NAS, the database will still think they exist. To check all database entries against your actual filesystem and remove dead links, enable pruning:
+    Edit library_management_config.json: set "*prune*": true and "process": false. Run the script.
 
-```json
-    "prune": true
-```
+1. Retroactive Audio Hashing:
+If you need to generate fast-match audio hashes for an existing database:
 
-**2. Retroactive Hashing (Prepopulate)**
-If you update the script to a new version supporting MD5 hashing, but already have thousands of files processed in your database, enable prepopulation. This will scan your existing master library and generate MD5 hashes for ultra-fast future duplicate detection:
+    Edit library_management_config.json: set "*hashAudio*": true and "process": false. Run the script.
 
-```json
-    "prepopulate": true
-```
+# Library Management Workflow
 
-**3. The Full Maintenance Pipeline**
-You can chain commands together. To clean up dead database links, update all file hashes, and then process any new incoming music in one go, set your configuration like this:
+In the music library management workflow, files are usually routed to the master directory, the duplicates folder, or the unresolved folder. However, there are several specific conditions where an audio file will be completely bypassed and left untouched in its original source directory:
 
-```json
-    "prune": true,
-    "prepopulate": true,
-    "process": true
-```
+1. "*Dry Run*" Mode is Active
+If "dry_run": true is set in the configuration JSON, the script simulates the entire fingerprinting, database, and deduplication logic, but explicitly bypasses all physical file operations (shutil.move and shutil.copy2). No files are actually moved.
 
-### 🧠 How Deduplication Works
+2. Unsupported File Extensions
+The script's main os.walk loop filters strictly for supported formats. Any file that does not end with .mp3, .flac, .m4a, .mp4, .wma, or .wav (such as .ogg, .ape, .jpg cover art, or .txt logs) is completely ignored by the scanner.
 
-* **The Fast Pass (Exact Match):** The script reads the incoming file and generates an MD5 hash. If that hash already exists in the database, the file is instantly moved to the `dup_folder`. No API calls, no audio decoding.
-* **The Smart Pass (Audio Quality Match):** If the file is technically distinct (different bitrates, different encodings), it generates an AcoustID fingerprint. The script first checks if this fingerprint is already associated with an album in your database. If it is, it auto-selects that album. If not, it uses sticky context or prompts you to select the correct album. Once an album is selected, it calculates a quality score.
-* **The Outcome:** The script strictly enforces quality. If the new file is better (e.g., FLAC replacing a 128kbps MP3), it upgrades your master library and sends the old file to the duplicates folder. If the quality of the new file **is not better**, it goes straight to the duplicates folder.
+3. The File is "Already Processed"
+At the very beginning of the per-file loop, the script queries the database for the exact file path. If the database returns processed = 1 for that path, the script assumes the file was handled in a previous run and instantly skips it.
+
+4. Zero-Byte or Inaccessible Files
+Before any fingerprinting begins, the script checks the file size using os.path.getsize(path).
+
+    * If the file is exactly 0 bytes (an empty shell file), it logs a warning and skips it.
+
+    * If the operating system throws a permission error (e.g., the file is locked by another program or owned by a restricted user), it logs an inaccessible warning and skips it.
+
+5. Mutagen Parsing Failure (Pre-API)
+If the mutagen library completely fails to read the file's audio headers to generate the bit-depth/sample-rate quality score, the _calculate_quality function returns None. Because this happens before the AcoustID API lookup or the C++ crash handler, the script aborts the loop early and leaves the file in the source directory rather than moving it to unresolved.
+
+6. Manual User Skip
+When the AcoustID API returns ambiguous album matches, the script pauses and prompts the user for a selection in the CLI. If the user inputs 0 (Skip) or q (Quit), the script honors the skip and abandons the file, leaving it exactly where it is.
+
+7. OS-Level Transfer Failures
+If a file successfully makes it through all logic checks, but the final _safe_move operation fails (e.g., the destination drive runs out of storage space, or a read-only permission blocks the transfer), the exception is caught, logged, and the original file remains in the source directory.
+
+# Global Deduplcation  
+
+In your MusicLibraryManager script, global_dedup is a configuration setting that determines how strictly the script searches for and removes duplicate songs in your library.
+
+It changes the boundary of the deduplication check in the **_handle_album_deduplication** function. Here is how the two modes work:
+
+1. When "**global_dedup**": false (Per-Album Deduplication)
+This is the default behavior. When set to false, the script will only look for duplicates of a song within the exact same album.
+
+How it works: It queries the database using both the acoustid_id (the song's fingerprint) AND the album_id.
+
+## Example
+
+If you have the song "Under Pressure" saved under Queen's original studio album Hot Space, and you also have a copy of "Under Pressure" saved under the compilation album Greatest Hits III, the script will keep both files. It views them as two distinct entities because their Album IDs do not match.
+
+### Best for
+
+People who want to maintain complete, intact albums. If you play an album from start to finish, you want every track to be there.
+
+1. When "**global_dedup**": true (Library-Wide Deduplication)
+When set to true, the script completely ignores album boundaries. It enforces a strict rule: There can only be one copy of a song in the entire master library.
+
+How it works: It queries the database using only the acoustid_id.
+
+Example: Using the "Under Pressure" example above, the script will notice that you have two copies of the same song in your library. It will then compare their quality scores. If the Hot Space version is a 320kbps MP3 and the Greatest Hits III version is a Lossless FLAC, the script will keep the FLAC version, update its tags, and throw the MP3 into your duplicates folder.
+
+### Best for
+
+People who listen to music primarily via shuffled playlists or single tracks and want to save as much hard drive space as possible by ruthlessly purging identical audio.
+
+### The Drawback of global_dedup
+
+If you turn this feature on, you will save a lot of disk space, but you will "break" compilation and greatest hits albums. If you try to listen to a Greatest Hits album straight through, it will be missing several tracks because the script determined the highest-quality master versions of those songs actually belonged to their original studio albums, and it deleted the duplicate copies from the Greatest Hits folder.
