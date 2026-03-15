@@ -1,6 +1,8 @@
 mutagensudo
 acoustid
 tqdm
+musicbrainzngs
+mutagen
 
 # System Binary: You must have the Chromaprint (fpcalc) binary installed and accessible in your system PATH (required by the acoustid library).
 # apt install nodejs

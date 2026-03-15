@@ -12,18 +12,16 @@ import traceback
 import json
 import hashlib
 import multiprocessing
+import musicbrainzngs
 from mutagen.id3 import ID3, TPE1, TPE2, TRCK, TPOS, TIT2, TALB
 from tqdm import tqdm
-import musicbrainzngs  # <--- NEW
-import mutagen.easyid3  # <--- NEW
 
-# Initialize MusicBrainz (Add this right under your imports)
+# Initialize MusicBrainz API wrapper
 musicbrainzngs.set_useragent(
     "MusicLibraryManager",
     "1.0",
-    "https://github.com/donhbryan/MusicLibraryManager",  # Or your email
+    "https://github.com/MusicLibraryManager"
 )
-
 
 # --- ISOLATED WORKER FUNCTION ---
 def _fingerprint_worker(path, queue):
@@ -38,7 +36,6 @@ def _fingerprint_worker(path, queue):
 
 
 # -----------------------------------------------
-
 
 class MusicLibraryManager:
     def __init__(self, config_file="library_management_config.json"):
@@ -107,11 +104,10 @@ class MusicLibraryManager:
     def _setup_database(self):
         """Creates the normalized database schema."""
         self.cur.execute("PRAGMA foreign_keys = ON")
-
-        # --- NEW: SQLite Performance Tuning (WAL Mode) ---
+        
+        # SQLite Performance Tuning (WAL Mode)
         self.cur.execute("PRAGMA journal_mode = WAL")
         self.cur.execute("PRAGMA synchronous = NORMAL")
-        # -------------------------------------------------
 
         self.cur.execute(
             """CREATE TABLE IF NOT EXISTS albums (
@@ -194,7 +190,7 @@ class MusicLibraryManager:
             "CREATE INDEX IF NOT EXISTS idx_file_blocks ON fingerprint_index(block)"
         )
 
-        # Purge old file_hashes data and repurpose for Audio Hash Tracking
+        # Audio Hash Tracking
         self.cur.execute("DROP TABLE IF EXISTS file_hashes")
         self.cur.execute(
             """CREATE TABLE IF NOT EXISTS audio_hashes (
@@ -239,25 +235,16 @@ class MusicLibraryManager:
         """Calculates an MD5 hash of a 30-second snippet of raw audio data."""
         hasher = hashlib.md5()
         try:
-            # Decode only a 30 second snippet starting at 15 seconds to dramatically speed up hashing
-            # Also locked to 1 thread to avoid heavy CPU thrashing on 10,000 files
             cmd = [
                 "ffmpeg",
-                "-threads",
-                "1",
-                "-v",
-                "quiet",
-                "-ss",
-                "00:00:15",
-                "-t",
-                "30",
-                "-i",
-                filepath,
-                "-f",
-                "s16le",
-                "-acodec",
-                "pcm_s16le",
-                "-",
+                "-threads", "1",
+                "-v", "quiet",
+                "-ss", "00:00:15",
+                "-t", "30",
+                "-i", filepath,
+                "-f", "s16le",
+                "-acodec", "pcm_s16le",
+                "-"
             ]
 
             with subprocess.Popen(
@@ -345,25 +332,6 @@ class MusicLibraryManager:
             "INSERT INTO fingerprint_index (block, path) VALUES (?, ?)", blocks
         )
 
-    def _display_local_matches(self, acoustid_id):
-        """Displays existing albums in the library that contain this song."""
-        try:
-            query = """
-                SELECT DISTINCT a.album_title, a.album_artist
-                FROM files f
-                JOIN albums a ON f.album_id = a.release_id
-                WHERE f.acoustid_id = ? AND f.processed = 1
-            """
-            self.cur.execute(query, (acoustid_id,))
-            rows = self.cur.fetchall()
-            if rows:
-                print(f"\n[INFO] You already have this song in your library:")
-                for title, artist in rows:
-                    print(f"   * {title} ({artist})")
-                print("-" * 80)
-        except sqlite3.Error as e:
-            logging.error(f"Failed to fetch local matches: {e}")
-
     def _get_owned_release_ids(self, acoustid_id):
         """Returns a set of release IDs for this AcoustID that are already in the library."""
         try:
@@ -373,73 +341,6 @@ class MusicLibraryManager:
         except sqlite3.Error as e:
             logging.error(f"Failed to fetch local matches: {e}")
             return set()
-
-    def _find_local_fuzzy_match(self, fingerprint):
-        blocks = self._get_blocks(fingerprint)
-        if not blocks:
-            return None, 0.0, None
-
-        placeholders = ",".join(["?"] * len(blocks))
-        query = f"SELECT DISTINCT path FROM fingerprint_index WHERE block IN ({placeholders})"
-        self.cur.execute(query, blocks)
-        candidates = [row[0] for row in self.cur.fetchall()]
-
-        best_path = None
-        best_score = 0.0
-        best_record = None
-
-        for cand_path in candidates:
-            self.cur.execute(
-                "SELECT fingerprint, quality_score, format, file_size FROM files WHERE path = ?",
-                (cand_path,),
-            )
-            res = self.cur.fetchone()
-            if not res:
-                continue
-
-            cand_fp, cand_q, cand_fmt, cand_size = res
-            if cand_q is None:
-                cand_q = 0.0
-
-            ratio = difflib.SequenceMatcher(None, fingerprint, cand_fp).ratio()
-
-            if ratio > best_score:
-                best_score = ratio
-                best_path = cand_path
-                best_record = {"score": cand_q, "format": cand_fmt, "size": cand_size}
-
-        return best_path, best_score, best_record
-
-    def _identify_locally(self, fingerprint):
-        blocks = self._get_blocks(fingerprint)
-        if not blocks:
-            return None, 0.0
-
-        placeholders = ",".join(["?"] * len(blocks))
-        query = f"SELECT DISTINCT acoustid_id FROM known_blocks WHERE block IN ({placeholders})"
-        self.cur.execute(query, blocks)
-        candidate_ids = [row[0] for row in self.cur.fetchall()]
-
-        if not candidate_ids:
-            return None, 0.0
-
-        best_id = None
-        best_score = 0.0
-
-        for cid in candidate_ids:
-            self.cur.execute(
-                "SELECT fingerprint FROM known_fingerprints WHERE acoustid_id = ?",
-                (cid,),
-            )
-            history_fps = self.cur.fetchall()
-
-            for (hist_fp,) in history_fps:
-                ratio = difflib.SequenceMatcher(None, fingerprint, hist_fp).ratio()
-                if ratio > best_score:
-                    best_score = ratio
-                    best_id = cid
-
-        return best_id, best_score
 
     def _calculate_quality(self, file_path):
         """Generates a quality score based heavily on format, then bit depth and size."""
@@ -452,22 +353,22 @@ class MusicLibraryManager:
             ext = os.path.splitext(file_path)[1].lower()
             file_size = os.path.getsize(file_path)
 
-            # Explicit format hierarchy (FLAC and ALAC favored due to metadata support)
+            # Explicit format hierarchy
             format_hierarchy = {
                 ".flac": 3 * 10**15,
-                ".m4a": 2.5 * 10**15,  # Apple Lossless
-                ".wav": 2 * 10**15,  # Lossless but poor metadata compatibility
+                ".m4a": 2.5 * 10**15, 
+                ".wav": 2 * 10**15,   
                 ".mp3": 1 * 10**15,
-                ".wma": 0.5 * 10**15,
+                ".wma": 0.5 * 10**15
             }
             fmt_score = format_hierarchy.get(ext, 0)
 
             bits = getattr(info, "bits_per_sample", 16)
             bit_score = bits * 10**12
-
+            
             # Reduce the weight of file size drastically so it only breaks ties
-            size_score = file_size / 1000
-
+            size_score = file_size / 1000 
+            
             sample_rate = getattr(info, "sample_rate", 44100)
             bitrate = getattr(info, "bitrate", 0)
             extras = (sample_rate / 10**6) + (bitrate / 10**9)
@@ -485,6 +386,89 @@ class MusicLibraryManager:
         except Exception as e:
             logging.error(f"Quality check failed for {file_path}: {e}")
             return None
+
+    def _fallback_musicbrainz_search(self, file_path):
+        """Attempts a text-based search on MusicBrainz using existing file metadata."""
+        try:
+            # Try to grab whatever tags currently exist on the file
+            audio = mutagen.File(file_path, easy=True)
+            if not audio:
+                return []
+
+            title = audio.get("title", [""])[0]
+            artist = audio.get("artist", [""])[0]
+            album = audio.get("album", [""])[0]
+
+            if not title or not artist:
+                logging.warning(f"Insufficient tags for MB fallback on {file_path}")
+                return []
+
+            print(f" -> AcoustID failed. Falling back to MusicBrainz metadata search: {artist} - {title}")
+            time.sleep(1) # Be polite to MusicBrainz API rate limits (1 request/sec)
+
+            # Build the query
+            query = f'artist:"{artist}" AND recording:"{title}"'
+            if album:
+                query += f' AND release:"{album}"'
+
+            result = musicbrainzngs.search_recordings(query=query, limit=5)
+            
+            candidates = []
+            for rec in result.get("recording-list", []):
+                rec_title = rec.get("title", "Unknown")
+                rec_id = rec.get("id")
+                
+                # A recording can belong to multiple releases
+                for rel in rec.get("release-list", []):
+                    rel_id = rel.get("id")
+                    
+                    # Create a mock medium/track list to satisfy track-number logic
+                    track_pos = 1
+                    disc_pos = 1
+                    if "medium-list" in rel:
+                        for med in rel["medium-list"]:
+                            disc_pos = med.get("position", 1)
+                            for trk in med.get("track-list", []):
+                                if trk.get("recording", {}).get("id") == rec_id:
+                                    track_pos = trk.get("number", 1)
+                                    break
+
+                    mock_release = {
+                        "id": rel_id,
+                        "title": rel.get("title", "Unknown Album"),
+                        "artists": [{"name": artist}],
+                        "date": {"year": rel.get("date", "0000")[:4]},
+                        "country": rel.get("country", "XX"),
+                        "mediums": [{
+                            "position": disc_pos,
+                            "tracks": [{"position": track_pos, "title": rec_title, "recording": {"id": rec_id}}]
+                        }]
+                    }
+                    
+                    mock_recording = {
+                        "id": rec_id,
+                        "title": rec_title,
+                        "artists": [{"name": artist}]
+                    }
+
+                    candidates.append({
+                        "similarity": float(rec.get("ext:score", 0)) / 100.0,
+                        "recording_title": rec_title,
+                        "album_title": mock_release["title"],
+                        "artist": artist,
+                        "date": str(mock_release["date"]["year"]),
+                        "country": mock_release["country"],
+                        "release": mock_release,
+                        "recording": mock_recording,
+                        "is_owned": False 
+                    })
+
+            candidates.sort(key=lambda x: x["similarity"], reverse=True)
+            return candidates
+
+        except Exception as e:
+            logging.error(f"MusicBrainz fallback failed for {file_path}: {e}")
+            return []
 
     def _get_candidates(self, results):
         """Parses API results and returns a list of all potential album matches."""
@@ -582,90 +566,6 @@ class MusicLibraryManager:
             except sqlite3.Error as e:
                 logging.error(f"Error closing database: {e}")
 
-def _fallback_musicbrainz_search(self, file_path):
-        """Attempts a text-based search on MusicBrainz using existing file metadata."""
-        try:
-            # Try to grab whatever tags currently exist on the file
-            audio = mutagen.File(file_path, easy=True)
-            if not audio:
-                return []
-
-            title = audio.get("title", [""])[0]
-            artist = audio.get("artist", [""])[0]
-            album = audio.get("album", [""])[0]
-
-            if not title or not artist:
-                logging.warning(f"Insufficient tags for MB fallback on {file_path}")
-                return []
-
-            print(f" -> AcoustID failed. Falling back to MusicBrainz metadata search: {artist} - {title}")
-            time.sleep(1) # Be polite to MusicBrainz API rate limits
-
-            # Build the query
-            query = f'artist:"{artist}" AND recording:"{title}"'
-            if album:
-                query += f' AND release:"{album}"'
-
-            result = musicbrainzngs.search_recordings(query=query, limit=5)
-            
-            candidates = []
-            for rec in result.get("recording-list", []):
-                rec_title = rec.get("title", "Unknown")
-                rec_id = rec.get("id")
-                
-                # A recording can belong to multiple releases
-                for rel in rec.get("release-list", []):
-                    rel_id = rel.get("id")
-                    
-                    # Create a mock medium/track list to satisfy your script's track-number logic
-                    track_pos = 1
-                    disc_pos = 1
-                    if "medium-list" in rel:
-                        for med in rel["medium-list"]:
-                            disc_pos = med.get("position", 1)
-                            for trk in med.get("track-list", []):
-                                if trk.get("recording", {}).get("id") == rec_id:
-                                    track_pos = trk.get("number", 1)
-                                    break
-
-                    mock_release = {
-                        "id": rel_id,
-                        "title": rel.get("title", "Unknown Album"),
-                        "artists": [{"name": artist}], # Approximation
-                        "date": {"year": rel.get("date", "0000")[:4]},
-                        "country": rel.get("country", "XX"),
-                        "mediums": [{
-                            "position": disc_pos,
-                            "tracks": [{"position": track_pos, "title": rec_title, "recording": {"id": rec_id}}]
-                        }]
-                    }
-                    
-                    mock_recording = {
-                        "id": rec_id,
-                        "title": rec_title,
-                        "artists": [{"name": artist}]
-                    }
-
-                    candidates.append({
-                        "similarity": float(rec.get("ext:score", 0)) / 100.0, # MB score is 0-100
-                        "recording_title": rec_title,
-                        "album_title": mock_release["title"],
-                        "artist": artist,
-                        "date": str(mock_release["date"]["year"]),
-                        "country": mock_release["country"],
-                        "release": mock_release,
-                        "recording": mock_recording,
-                        "is_owned": False # Default to false for fallbacks
-                    })
-
-            # Sort by highest match score
-            candidates.sort(key=lambda x: x["similarity"], reverse=True)
-            return candidates
-
-        except Exception as e:
-            logging.error(f"MusicBrainz fallback failed for {file_path}: {e}")
-            return []
-        
     def _prompt_user_selection(self, file_path, candidates):
         filename = os.path.basename(file_path)
         page_size = 10
@@ -824,7 +724,7 @@ def _fallback_musicbrainz_search(self, file_path):
                 "SELECT path, quality_score FROM files WHERE acoustid_id = ? AND album_id = ? AND processed = 1",
                 (acoustid_id, release_id),
             )
-
+        
         existing = self.cur.fetchone()
 
         if not existing:
@@ -959,16 +859,10 @@ def _fallback_musicbrainz_search(self, file_path):
             logging.warning(f"Skipping inaccessible file: {path}")
             return
 
-        # ==========================================
-        # CALCULATE QUALITY SCORE FIRST
-        # ==========================================
         quality = self._calculate_quality(path)
         if not quality:
             return
 
-        # ==========================================
-        # FAST EXACT DUPLICATE CHECK (Audio payload only)
-        # ==========================================
         audio_hash = self._get_audio_hash(path)
         if audio_hash:
             self.cur.execute(
@@ -976,39 +870,20 @@ def _fallback_musicbrainz_search(self, file_path):
             )
             if dup_row := self.cur.fetchone():
                 existing_path = dup_row[0]
-
-                # We have a match. Compare qualities.
-                self.cur.execute(
-                    "SELECT quality_score FROM files WHERE path = ?", (existing_path,)
-                )
+                
+                self.cur.execute("SELECT quality_score FROM files WHERE path = ?", (existing_path,))
                 existing_score_row = self.cur.fetchone()
-                existing_score = (
-                    existing_score_row[0]
-                    if existing_score_row and existing_score_row[0] is not None
-                    else 0.0
-                )
+                existing_score = existing_score_row[0] if existing_score_row and existing_score_row[0] is not None else 0.0
 
                 if quality["score"] > existing_score:
-                    print(
-                        f" -> Exact audio match found! Upgrading quality ({existing_score} -> {quality['score']})"
-                    )
+                    print(f" -> Exact audio match found! Upgrading quality ({existing_score} -> {quality['score']})")
                     if not self.dry_run:
-                        self._safe_move(
-                            existing_path, self.dup_folder, operation="move"
-                        )
-                        self.cur.execute(
-                            "DELETE FROM files WHERE path = ?", (existing_path,)
-                        )
-                        self.cur.execute(
-                            "UPDATE audio_hashes SET path = ? WHERE audio_hash = ?",
-                            (path, audio_hash),
-                        )
+                        self._safe_move(existing_path, self.dup_folder, operation="move")
+                        self.cur.execute("DELETE FROM files WHERE path = ?", (existing_path,))
+                        self.cur.execute("UPDATE audio_hashes SET path = ? WHERE audio_hash = ?", (path, audio_hash))
                         self.conn.commit()
-                    # Do not return here. Let the new file continue down so it gets fingerprinted and tagged.
                 else:
-                    print(
-                        f" -> Exact audio duplicate found (lower/equal quality). Skipping API."
-                    )
+                    print(f" -> Exact audio duplicate found (lower/equal quality). Skipping API.")
                     print(f"    (Matches: {os.path.basename(existing_path)})")
                     self._safe_move(path, self.dup_folder, operation="move")
 
@@ -1018,16 +893,9 @@ def _fallback_musicbrainz_search(self, file_path):
                             (path,),
                         )
                         self.conn.commit()
-                    else:
-                        print(
-                            f" -> [DRY RUN] Would update database to mark as processed duplicate."
-                        )
                     return
-        # ==========================================
 
         try:
-            # --- NEW ISOLATED FINGERPRINTING BLOCK ---
-            # Switched to 'fork' for much faster isolated process spawning on Linux
             ctx = multiprocessing.get_context("fork")
             q = ctx.Queue()
             p = ctx.Process(target=_fingerprint_worker, args=(path, q))
@@ -1035,29 +903,21 @@ def _fallback_musicbrainz_search(self, file_path):
             p.join()
 
             if p.exitcode != 0:
-                logging.error(
-                    f"Chromaprint C++ crash on {path}. File is likely severely corrupt."
-                )
-                print(
-                    f" -> Corrupt file detected (C++ engine crash). Moving to unresolved."
-                )
+                logging.error(f"Chromaprint C++ crash on {path}. File is likely severely corrupt.")
+                print(f" -> Corrupt file detected (C++ engine crash). Moving to unresolved.")
                 self._safe_move(path, self.unresolved_folder, operation="move")
                 return
 
             fp_result = q.get()
             if "error" in fp_result:
-                logging.warning(
-                    f"Skipping unreadable audio file {path}: {fp_result['error']}"
-                )
+                logging.warning(f"Skipping unreadable audio file {path}: {fp_result['error']}")
                 print(f" -> Unreadable file. Moving to unresolved.")
                 self._safe_move(path, self.unresolved_folder, operation="move")
                 return
 
             duration = fp_result["duration"]
             fingerprint = fp_result["fingerprint"]
-            # -----------------------------------------
 
-            # Sleep ONLY here right before the external API call to avoid rate limits
             time.sleep(self.API_SLEEP)
             resp = acoustid.lookup(
                 self.api_key,
@@ -1066,24 +926,29 @@ def _fallback_musicbrainz_search(self, file_path):
                 meta="recordings releases tracks",
             )
 
-            if resp.get("status") != "ok" or not resp.get("results"):
-                logging.warning(f"No match for {path}")
-                print(f" -> No match found. Moving to unresolved.")
-                self._safe_move(path, self.unresolved_folder, operation="move")
-                return
-
-            candidates = self._get_candidates(resp["results"])
-
+            # --- HYBRID SEARCH: AcoustID first, then MusicBrainz fallback ---
+            candidates = []
+            if resp.get("status") == "ok" and resp.get("results"):
+                candidates = self._get_candidates(resp["results"])
+            
             if not candidates:
-                logging.warning(f"No valid candidates parsed for {path}")
-                print(f" -> No candidates. Moving to unresolved.")
+                candidates = self._fallback_musicbrainz_search(path)
+            
+            if not candidates:
+                logging.warning(f"No matches on AcoustID or MusicBrainz for {path}")
+                print(f" -> Unidentified audio. Moving to unresolved.")
                 self._safe_move(path, self.unresolved_folder, operation="move")
                 return
 
             top_match = candidates[0]
-            current_acoustid_id = resp["results"][0]["id"]
-
-            self._update_fingerprint_cache(current_acoustid_id, fingerprint)
+            
+            # Use AcoustID if available, otherwise use MusicBrainz Recording ID for deduplication tracking
+            current_acoustid_id = None
+            if resp.get("status") == "ok" and resp.get("results"):
+                current_acoustid_id = resp["results"][0]["id"]
+                self._update_fingerprint_cache(current_acoustid_id, fingerprint)
+            else:
+                current_acoustid_id = top_match["recording"]["id"]
 
             owned_ids = self._get_owned_release_ids(current_acoustid_id)
             for c in candidates:
@@ -1102,18 +967,12 @@ def _fallback_musicbrainz_search(self, file_path):
             top_match = candidates[0]
             selected_matches = []
 
-            # --- NEW FEATURE: Prior Associations Filter ---
-            # If the database already knows about this file in specific albums,
-            # bypass prompts and auto-select those albums to run the quality upgrade check.
             owned_candidates = [c for c in candidates if c.get("is_owned")]
 
             if owned_candidates:
-                print(
-                    f" -> Found prior associations. Auto-selecting {len(owned_candidates)} existing album(s)."
-                )
+                print(f" -> Found prior associations. Auto-selecting {len(owned_candidates)} existing album(s).")
                 selected_matches = owned_candidates
             else:
-                # Fallback to Sticky Matching / Strict API Auto-Select / Manual Prompt
                 sticky_match = None
 
                 if self.last_selected_album_id:
@@ -1126,9 +985,7 @@ def _fallback_musicbrainz_search(self, file_path):
                             break
 
                 if sticky_match:
-                    logging.info(
-                        f"Auto-selected sticky album: {sticky_match['album_title']}"
-                    )
+                    logging.info(f"Auto-selected sticky album: {sticky_match['album_title']}")
                     selected_matches = [sticky_match]
                 elif len(candidates) == 1 and top_match["similarity"] >= 0.98:
                     selected_matches = [top_match]
@@ -1142,9 +999,7 @@ def _fallback_musicbrainz_search(self, file_path):
                     selected_matches = result or []
 
                     if len(selected_matches) == 1:
-                        self.last_selected_album_id = selected_matches[0]["release"][
-                            "id"
-                        ]
+                        self.last_selected_album_id = selected_matches[0]["release"]["id"]
                     else:
                         self.last_selected_album_id = None
 
@@ -1152,7 +1007,6 @@ def _fallback_musicbrainz_search(self, file_path):
                 logging.info(f"Skipped by user: {path}")
                 return
 
-            # Process the selected albums
             for idx, selected_match in enumerate(selected_matches):
                 is_last_item = idx == len(selected_matches) - 1
                 self._process_match_for_file(
@@ -1223,9 +1077,7 @@ def _fallback_musicbrainz_search(self, file_path):
                 break
 
         if not found_track:
-            logging.warning(
-                f"Exact ID match failed for {path}. Attempting Title match fallback."
-            )
+            logging.warning(f"Exact ID match failed for {path}. Attempting Title match fallback.")
             for medium in rel.get("mediums", []):
                 current_disc = medium.get("position", 1)
                 for track in medium.get("tracks", []):
