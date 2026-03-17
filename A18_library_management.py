@@ -1179,7 +1179,7 @@ if __name__ == "__main__":
         )
         default_config = {
             "api_key": "7dlZplmc3N",
-            "music_folder": "/mnt/NAS/cleanmusic/music/",
+            "music_folder": "/mnt/NAS/cleanmusic/music2/",
             "destination_folder": "/mnt/NAS/cleanmusic/NewMaster/",
             "dup_folder": "/mnt/NAS/cleanmusic/duplicates/",
             "unresolved_folder": "/mnt/NAS/cleanmusic/unresolved/",
