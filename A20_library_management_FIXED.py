@@ -9,10 +9,10 @@ import difflib
 import traceback
 import json
 import hashlib
-import multiprocessing
-import queue
 import threading
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+from queue import Queue
 
 import acoustid
 import mutagen
@@ -26,9 +26,12 @@ musicbrainzngs.set_useragent(
 )
 
 
-# --- ISOLATED CPU WORKER ---
+# --- ISOLATED CPU WORKER (NO MULTIPROCESSING) ---
 def _cpu_bound_worker(path):
-    """Handles heavy lifting: ffmpeg hashing and acoustid fingerprinting in an isolated process."""
+    """
+    Handles heavy lifting: ffmpeg hashing and acoustid fingerprinting.
+    NOW RUNS IN THREADS (not processes) to avoid database segfaults.
+    """
     result = {
         "path": path,
         "hash": None,
@@ -38,7 +41,7 @@ def _cpu_bound_worker(path):
     }
 
     try:
-        # 1. Hashing
+        # 1. Hashing with ffmpeg
         hasher = hashlib.md5()
         cmd = [
             "ffmpeg",
@@ -58,23 +61,34 @@ def _cpu_bound_worker(path):
             "pcm_s16le",
             "-",
         ]
-        with subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        ) as process:
-            for chunk in iter(lambda: process.stdout.read(8192 * 1024), b""):
-                hasher.update(chunk)
-        result["hash"] = hasher.hexdigest()
+        try:
+            with subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            ) as process:
+                for chunk in iter(lambda: process.stdout.read(8192 * 1024), b""):
+                    if chunk:
+                        hasher.update(chunk)
+            result["hash"] = hasher.hexdigest()
+        except Exception as e:
+            logging.warning(f"Hashing failed for {path}: {e}")
+            result["hash"] = None
 
-        # 2. Fingerprinting - use fresh import
-        from acoustid import fingerprint_file
+        # 2. Fingerprinting with acoustid (fresh import in thread)
+        try:
+            import acoustid as acoustid_module
 
-        duration, fingerprint = fingerprint_file(path)
-        result["duration"] = duration
-        result["fingerprint"] = fingerprint
+            duration, fingerprint = acoustid_module.fingerprint_file(path)
+            result["duration"] = duration
+            result["fingerprint"] = fingerprint
+        except Exception as e:
+            logging.warning(f"Fingerprinting failed for {path}: {e}")
+            result["fingerprint"] = None
+            result["duration"] = None
 
     except Exception as e:
         result["error"] = str(e)
-        traceback.print_exc()  # Log the actual error
+        logging.error(f"Worker error on {path}: {e}")
+        traceback.print_exc()
 
     return result
 
@@ -135,6 +149,7 @@ class MusicLibraryManager:
             format="%(asctime)s - %(levelname)s - %(message)s",
         )
 
+        # Main thread connection (only for reads before processing starts)
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.cur = self.conn.cursor()
         self._setup_database()
@@ -222,7 +237,10 @@ class MusicLibraryManager:
         self.conn.commit()
 
     def _db_writer_thread(self):
-        """Runs in the background, executing queued DB operations sequentially."""
+        """
+        Runs in the background, executing queued DB operations sequentially.
+        CRITICAL: This thread owns the cursor and connection - no other thread touches the DB directly.
+        """
         operations_count = 0
         while True:
             task = self.db_queue.get()
@@ -243,6 +261,7 @@ class MusicLibraryManager:
                     operations_count = 0
             except sqlite3.Error as e:
                 logging.error(f"Database write failed: {e} | Query: {query}")
+                traceback.print_exc()
             finally:
                 self.db_queue.task_done()
 
@@ -311,7 +330,8 @@ class MusicLibraryManager:
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
             ) as process:
                 for chunk in iter(lambda: process.stdout.read(8192 * 1024), b""):
-                    hasher.update(chunk)
+                    if chunk:
+                        hasher.update(chunk)
             return hasher.hexdigest()
         except Exception as e:
             logging.error(f"Audio hashing failed for {filepath}: {e}")
@@ -346,13 +366,19 @@ class MusicLibraryManager:
             print("All known files already have audio hashes.")
 
     def _get_blocks(self, fingerprint):
+        if not fingerprint:
+            return []
         return [
             fingerprint[i : i + self.BLOCK_SIZE]
             for i in range(0, len(fingerprint), self.BLOCK_SIZE)
         ][:16]
 
     def _update_fingerprint_cache(self, acoustid_id, fingerprint):
-        """Saves association via queue."""
+        """Saves association via queue. NEVER call self.cur directly here!"""
+        if not acoustid_id or not fingerprint:
+            return
+
+        # Queue the insert
         self.db_queue.put(
             (
                 "execute",
@@ -360,40 +386,65 @@ class MusicLibraryManager:
                 (fingerprint, acoustid_id),
             )
         )
-        self.cur.execute(
-            "SELECT 1 FROM known_blocks WHERE acoustid_id = ? LIMIT 1", (acoustid_id,)
-        )
-        if not self.cur.fetchone():
-            blocks = [(b, acoustid_id) for b in self._get_blocks(fingerprint)]
-            self.db_queue.put(
-                (
-                    "executemany",
-                    "INSERT INTO known_blocks (block, acoustid_id) VALUES (?, ?)",
-                    blocks,
-                )
+
+        # Check if blocks exist - use a separate read-only query
+        # This is a race condition but acceptable for this use case
+        try:
+            # Use a separate connection for read-only queries
+            check_conn = sqlite3.connect(self.db_path)
+            check_cur = check_conn.cursor()
+            check_cur.execute(
+                "SELECT 1 FROM known_blocks WHERE acoustid_id = ? LIMIT 1",
+                (acoustid_id,),
             )
+            if not check_cur.fetchone():
+                blocks = [(b, acoustid_id) for b in self._get_blocks(fingerprint)]
+                if blocks:
+                    self.db_queue.put(
+                        (
+                            "executemany",
+                            "INSERT INTO known_blocks (block, acoustid_id) VALUES (?, ?)",
+                            blocks,
+                        )
+                    )
+            check_conn.close()
+        except Exception as e:
+            logging.warning(f"Could not check known_blocks: {e}")
 
     def _update_index(self, path, fingerprint):
-        """Updates local index via queue."""
+        """Updates local index via queue. NEVER call self.cur directly here!"""
+        if not fingerprint or not path:
+            return
+
         self.db_queue.put(
             ("execute", "DELETE FROM fingerprint_index WHERE path = ?", (path,))
         )
         blocks = [(b, path) for b in self._get_blocks(fingerprint)]
-        self.db_queue.put(
-            (
-                "executemany",
-                "INSERT INTO fingerprint_index (block, path) VALUES (?, ?)",
-                blocks,
+        if blocks:
+            self.db_queue.put(
+                (
+                    "executemany",
+                    "INSERT INTO fingerprint_index (block, path) VALUES (?, ?)",
+                    blocks,
+                )
             )
-        )
 
     def _get_owned_release_ids(self, acoustid_id):
+        """
+        Safely fetch owned release IDs using a separate connection.
+        NEVER call self.cur from worker threads!
+        """
         try:
-            self.cur.execute(
+            # Use a separate read-only connection
+            read_conn = sqlite3.connect(self.db_path)
+            read_cur = read_conn.cursor()
+            read_cur.execute(
                 "SELECT DISTINCT album_id FROM files WHERE acoustid_id = ? AND processed = 1",
                 (acoustid_id,),
             )
-            return set(row[0] for row in self.cur.fetchall())
+            result = set(row[0] for row in read_cur.fetchall())
+            read_conn.close()
+            return result
         except sqlite3.Error as e:
             logging.error(f"Failed to fetch local matches: {e}")
             return set()
@@ -519,6 +570,8 @@ class MusicLibraryManager:
             candidates.sort(key=lambda x: x["similarity"], reverse=True)
             return candidates
         except Exception as e:
+            logging.error(f"Fallback search error: {e}")
+            traceback.print_exc()
             return []
 
     def _get_candidates(self, results):
@@ -737,18 +790,31 @@ class MusicLibraryManager:
     def _handle_album_deduplication(
         self, path, acoustid_id, release_id, quality, dispose_source=False
     ):
-        if self.global_dedup:
-            self.cur.execute(
-                "SELECT path, quality_score FROM files WHERE acoustid_id = ? AND processed = 1",
-                (acoustid_id,),
-            )
-        else:
-            self.cur.execute(
-                "SELECT path, quality_score FROM files WHERE acoustid_id = ? AND album_id = ? AND processed = 1",
-                (acoustid_id, release_id),
-            )
+        """
+        Check for duplicates using a separate read-only connection.
+        NEVER call self.cur from worker threads!
+        """
+        try:
+            read_conn = sqlite3.connect(self.db_path)
+            read_cur = read_conn.cursor()
 
-        existing = self.cur.fetchone()
+            if self.global_dedup:
+                read_cur.execute(
+                    "SELECT path, quality_score FROM files WHERE acoustid_id = ? AND processed = 1",
+                    (acoustid_id,),
+                )
+            else:
+                read_cur.execute(
+                    "SELECT path, quality_score FROM files WHERE acoustid_id = ? AND album_id = ? AND processed = 1",
+                    (acoustid_id, release_id),
+                )
+
+            existing = read_cur.fetchone()
+            read_conn.close()
+        except sqlite3.Error as e:
+            logging.error(f"Failed to check for duplicates: {e}")
+            return True
+
         if not existing:
             return True
 
@@ -833,6 +899,7 @@ class MusicLibraryManager:
                 audio.save()
         except Exception as e:
             logging.error(f"Tagging Error {file_path}: {e}")
+            traceback.print_exc()
 
     def _sanitize_name(self, name):
         if not name:
@@ -846,9 +913,24 @@ class MusicLibraryManager:
         target_dir = os.path.join(self.destination_folder, artist_dir, album_dir)
         return self._safe_move(current_path, target_dir, filename, operation=operation)
 
+    def _query_audio_hash_safely(self, audio_hash):
+        """Thread-safe query for audio hash using a separate connection"""
+        try:
+            read_conn = sqlite3.connect(self.db_path)
+            read_cur = read_conn.cursor()
+            read_cur.execute(
+                "SELECT path FROM audio_hashes WHERE audio_hash = ?", (audio_hash,)
+            )
+            result = read_cur.fetchone()
+            read_conn.close()
+            return result
+        except sqlite3.Error as e:
+            logging.error(f"Failed to query audio hash: {e}")
+            return None
+
     def process_library(self):
         # --- INITIALIZE BACKGROUND DB WRITER ---
-        self.db_queue = queue.Queue()
+        self.db_queue = Queue()
         writer_thread = threading.Thread(target=self._db_writer_thread, daemon=True)
         writer_thread.start()
 
@@ -874,22 +956,29 @@ class MusicLibraryManager:
 
         ambiguous_queue = []
 
-        # --- PHASE 1: CPU-BOUND CRUNCHING (ProcessPool) ---
+        # --- PHASE 1: CPU-BOUND CRUNCHING (ThreadPool, NOT ProcessPool) ---
         print("Stage 1: Crunching audio data (Hashing & Fingerprinting)...")
         cpu_results = []
-        with ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-            for result in tqdm(
-                executor.map(_cpu_bound_worker, pending_files), total=len(pending_files)
-            ):
-                if result.get("error"):
-                    logging.warning(
-                        f"Worker error on {result['path']}: {result['error']}"
-                    )
-                    self._safe_move(
-                        result["path"], self.unresolved_folder, operation="move"
-                    )
-                else:
-                    cpu_results.append(result)
+        # Use ThreadPoolExecutor instead of ProcessPoolExecutor to avoid database issues
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(_cpu_bound_worker, path) for path in pending_files
+            ]
+            for future in tqdm(as_completed(futures), total=len(pending_files)):
+                try:
+                    result = future.result()
+                    if result.get("error"):
+                        logging.warning(
+                            f"Worker error on {result['path']}: {result['error']}"
+                        )
+                        self._safe_move(
+                            result["path"], self.unresolved_folder, operation="move"
+                        )
+                    else:
+                        cpu_results.append(result)
+                except Exception as e:
+                    logging.error(f"Future error: {e}")
+                    traceback.print_exc()
 
         # --- PHASE 2: NETWORK & API RESOLUTION (ThreadPool) ---
         print("\nStage 2: Fetching API Metadata & Organizing...")
@@ -902,16 +991,22 @@ class MusicLibraryManager:
 
             audio_hash = file_data["hash"]
             if audio_hash:
-                self.cur.execute(
-                    "SELECT path FROM audio_hashes WHERE audio_hash = ?", (audio_hash,)
-                )
-                if dup_row := self.cur.fetchone():
+                dup_row = self._query_audio_hash_safely(audio_hash)
+                if dup_row:
                     existing_path = dup_row[0]
-                    self.cur.execute(
-                        "SELECT quality_score FROM files WHERE path = ?",
-                        (existing_path,),
-                    )
-                    existing_score_row = self.cur.fetchone()
+                    try:
+                        read_conn = sqlite3.connect(self.db_path)
+                        read_cur = read_conn.cursor()
+                        read_cur.execute(
+                            "SELECT quality_score FROM files WHERE path = ?",
+                            (existing_path,),
+                        )
+                        existing_score_row = read_cur.fetchone()
+                        read_conn.close()
+                    except sqlite3.Error as e:
+                        logging.error(f"Failed to query quality score: {e}")
+                        existing_score_row = None
+
                     existing_score = (
                         existing_score_row[0]
                         if existing_score_row and existing_score_row[0] is not None
@@ -951,7 +1046,12 @@ class MusicLibraryManager:
 
             time.sleep(self.API_SLEEP)
             try:
-                resp = acoustid.lookup(
+                if not file_data.get("fingerprint"):
+                    return {"status": "unresolved", "path": path}
+
+                import acoustid as acoustid_module
+
+                resp = acoustid_module.lookup(
                     self.api_key,
                     file_data["fingerprint"],
                     file_data["duration"],
@@ -959,6 +1059,7 @@ class MusicLibraryManager:
                 )
             except Exception as e:
                 logging.error(f"API failed for {path}: {e}")
+                traceback.print_exc()
                 return {"status": "error", "path": path}
 
             candidates = (
@@ -1044,27 +1145,31 @@ class MusicLibraryManager:
                     "quality": quality,
                 }
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=2) as executor:
             futures = [executor.submit(_api_worker, data) for data in cpu_results]
             for future in tqdm(as_completed(futures), total=len(futures)):
-                res = future.result()
-                if res["status"] == "unresolved":
-                    self._safe_move(
-                        res["path"], self.unresolved_folder, operation="move"
-                    )
-                elif res["status"] == "needs_user":
-                    ambiguous_queue.append(res)
-                elif res["status"] == "auto_resolved":
-                    for idx, match in enumerate(res["match"]):
-                        self._process_match_for_file(
-                            res["path"],
-                            res["acoustid"],
-                            res["data"]["fingerprint"],
-                            res["quality"],
-                            res["data"]["hash"],
-                            match,
-                            idx == len(res["match"]) - 1,
+                try:
+                    res = future.result()
+                    if res["status"] == "unresolved":
+                        self._safe_move(
+                            res["path"], self.unresolved_folder, operation="move"
                         )
+                    elif res["status"] == "needs_user":
+                        ambiguous_queue.append(res)
+                    elif res["status"] == "auto_resolved":
+                        for idx, match in enumerate(res["match"]):
+                            self._process_match_for_file(
+                                res["path"],
+                                res["acoustid"],
+                                res["data"]["fingerprint"],
+                                res["quality"],
+                                res["data"]["hash"],
+                                match,
+                                idx == len(res["match"]) - 1,
+                            )
+                except Exception as e:
+                    logging.error(f"API worker error: {e}")
+                    traceback.print_exc()
 
         # --- PHASE 3: INTERACTIVE RESOLUTION ---
         if ambiguous_queue:
@@ -1272,5 +1377,8 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
         print("\nProcess interrupted by user. Shutting down gracefully...")
+    except Exception as e:
+        logging.error(f"Fatal error: {e}")
+        traceback.print_exc()
     finally:
         manager.close()
