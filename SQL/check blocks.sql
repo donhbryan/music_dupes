@@ -1,5 +1,9 @@
 SELECT DISTINCT path  from files 
-where path like  "%Beyt Bieh%"
+where path like  "%Earth Wind%"
+--delete from files where path like  "%Earth Wind%"
+--delete from audio_hashes where path like  "%Earth Wind%"
+--delete from fingerprint_index where path like  "%Earth Wind%"
+--delete from fp_index2 where path like  "%Earth Wind%"
 
 SELECT DISTINCT path FROM fingerprint_index 
 --where path like  "%Beyt Bieh%"
