@@ -30,5 +30,6 @@ Thumbs.db
 *.tmp
 *.swp   
 *.swo
-library_manager.db-shm
-library_manager.db-wal
+*.db-shm
+*.db-wal
+*.sqbpro
