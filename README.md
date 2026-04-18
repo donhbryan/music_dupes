@@ -12,6 +12,15 @@ An automated, high-performance music library organizer and deduplicator. This to
 * **Automated Tagging:** Applies standardized ID3, Vorbis, and MP4 tags (Title, Artist, Album, Album Artist, Track No, Disc No) using the `mutagen` library.
 * **High-Performance Database:** Uses an optimized SQLite3 database with Write-Ahead Logging (WAL) to track known fingerprints, audio blocks, and file histories, drastically speeding up subsequent runs.
 
+## 🌟 New Features in A19b
+
+* **Concurrent Processing:** Leverages multithreading with `ThreadPoolExecutor` to process files concurrently during the initial phase, reducing overall runtime for large libraries by parallelizing database and API operations.
+* **Memory Preloading:** Loads processed files and audio hashes into memory at startup for instant lookups, minimizing database queries and improving performance on subsequent runs.
+* **Sticky Match Auto-Resolution:** Automatically applies the last user-selected album to similar ambiguous matches, streamlining interactive resolution and reducing manual prompts.
+* **Enhanced Interactive Mode:** Includes pagination for candidate browsing (10 items per page) with navigation controls (next/previous, replay audio), making it easier to handle extensive result sets.
+* **Advanced Database Optimizations:** Employs SQLite features like WAL mode, foreign key constraints, and auto-updating triggers, plus a dedicated table for tracking ambiguous files, ensuring better data integrity and faster operations.
+* **Improved Error Handling:** Enhanced resilience with detailed logging, API fallback mechanisms (e.g., MusicBrainz search), and graceful handling of timeouts or corrupt files, allowing the script to continue processing without full failures.
+
 ## 📋 Prerequisites
 
 Ensure you have the following system dependencies installed before running the script:
@@ -25,6 +34,14 @@ Ensure you have the following system dependencies installed before running the s
   * *Ubuntu/Debian:* `sudo apt install libchromaprint-tools`
   * *macOS:* `brew install chromaprint`
 * **CLI Audio Player (Optional but Recommended):** For interactive match resolution. The script looks for `afplay` (macOS default), `ffplay`, `mpv`, or `cvlc`.
+
+## ⚠️ Drawbacks and Considerations
+
+* **Resource Intensive:** Concurrent processing and memory preloading may increase CPU, RAM, and I/O usage, potentially impacting performance on underpowered systems or during batch operations.
+* **Complexity in Debugging:** Multithreading can introduce race conditions or inconsistent states, making troubleshooting more challenging, especially in interactive scenarios.
+* **User Interaction Required:** Despite optimizations like sticky matching, ambiguous cases still demand manual input, which can slow down automation for very large or frequently ambiguous libraries.
+* **Potential for Partial Failures:** In concurrent environments, errors (e.g., API limits or file issues) might affect only some threads, leading to incomplete processing that requires manual review.
+* **Memory Constraints:** Preloading large databases may exceed available RAM on systems with extensive libraries, risking out-of-memory errors.
 
 ## 🚀 Installation
 
