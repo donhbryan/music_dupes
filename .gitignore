@@ -24,7 +24,7 @@ oldCode/
 *.alac
 
 *.ds_store
-Thumbs.db
+*.db
 *.sqlite
 *.bak
 *.tmp
