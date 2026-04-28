@@ -23,9 +23,9 @@ An automated, high-performance music library organizer and deduplicator. This to
 * **Previous Version:** 8 worker threads fought over a single SQLite `threading.RLock()`. Because SQLite only permits one concurrent writer, threads were forced to wait sequentially, neutralizing the benefits of parallel processing.
 * **New Version:** A dedicated background `db_writer_thread` handles all database `INSERT`, `UPDATE`, and `DELETE` commands. Worker threads simply drop their database commands into a thread-safe `queue.Queue()` and instantly move on to the next file.
 
-### 3. Deferred Audio Hashing (CPU Optimization)
-* **Previous Version:** The script calculated a CPU-heavy 30-second `ffmpeg` audio hash for *every* file immediately before checking the AcoustID API.
-* **New Version:** The script now defers the heavy `ffmpeg` processing until *after* the AcoustID API confirms an ambiguity exists and a strict hash-check is required, drastically reducing CPU load on large libraries.
+### 3. Database Rebuild Synchronization (New in A19e)
+* **Previous Version:** If the database was corrupted or lost, the script required moving all files and running them through the standard processor from scratch.
+* **New Version:** Included a new `"rebuild_db"` flag to construct a fully authoritative database by syncing backwards from existing `Artist / Album / Song` directory structures. It securely extracts pre-existing MusicBrainz and AcoustID tags directly via Mutagen to save API lookup limits, using MusicBrainz as the authoritative anchor.
 
 ### 4. Fully Read-Only Dry Runs
 * **Previous Version:** The `dry_run` flag prevented physical file moves but still inadvertently wrote dummy paths to the database, causing corruption.
@@ -52,7 +52,8 @@ pip install pyacoustid mutagen tqdm
 
 On the first run, the script generates `library_management_config.json`:
 
-```json
+```
+JSON
 {
     "api_key": "YOUR_ACOUSTID_API_KEY",
     "music_folder": "/path/to/raw/music/",
@@ -63,42 +64,63 @@ On the first run, the script generates `library_management_config.json`:
     "dry_run": false,
     "prune": false,
     "hashAudio": false,
+    "rebuild_db": false,
     "global_dedup": false,
     "process": true
 }
 ```
 
-### Configuration Flags Explained
+## Configuration Flags Explained
+  - **api_key:** Your AcoustID API key.
 
-* **`api_key`**: Your AcoustID API key.
-* **`dry_run`**: Set to `true` to simulate the process. Completely read-only.
-* **`prune`**: Set to `true` to clean the database of ghost records for files that have been deleted from your physical drive.
-* **`hashAudio`**: Set to `true` to retroactively generate audio hashes for processed files that are currently missing them.
-* **`global_dedup`**: 
-    * `false` *(Default)*: Deduplication only happens within the same Album ID. Keeps full albums intact.
-    * `true`: Enforces strict library-wide deduplication. Breaks compilation albums but saves maximum disk space.
-* **`process`**: Set to `true` to run the main library organization workflow.
+  - **dry_run:** Set to true to simulate the process. Completely read-only.
+
+- **prune:** Set to true to clean the database of ghost records for files that have been deleted from your physical drive.
+
+- **hashAudio:** Set to true to retroactively generate audio hashes for processed files that are currently missing them.
+
+- **rebuild_db:** Set to true to construct/sync the SQLite database directly from existing sorted directories. Enforces song-to-album relationships and populates definitive tags from MusicBrainz.
+
+- **global_dedup:**  
+  - false (Default): Deduplication only happens within the same Album ID. Keeps full albums intact.
+
+  - true: Enforces strict library-wide deduplication. Breaks compilation albums but saves maximum disk space.
+
+- **process:** Set to true to run the main library organization workflow.
 
 ## 💻 Maintenance Workflows
+**Standard Processing:** Set "process": true.
 
-1. **Standard Processing:** Set `"process": true`.
-2. **Database Cleanup (Pruning):** Set `"prune": true` and `"process": false`.
-3. **Retroactive Hashing:** Set `"hashAudio": true` and `"process": false`.
+**Database Cleanup (Pruning):** Set "prune": true and "process": false.
+
+**Retroactive Hashing:** Set "hashAudio": true and "process": false.
+
+**Database Reconstruction:** Set "rebuild_db": true and "process": false.
 
 ## 🧠 How the Deduplication Hierarchy Works
-
 Quality score hierarchy (size and bit-depth are tie-breakers):
-1. **FLAC** (Lossless + Robust Metadata)
-2. **M4A / ALAC** (Lossless + Robust Metadata)
-3. **WAV** (Lossless + Poor Metadata Support)
-4. **MP3** (Lossy)
-5. **WMA** (Lossy)
+
+- FLAC (Lossless + Robust Metadata)
+
+- M4A / ALAC (Lossless + Robust Metadata)
+
+- WAV (Lossless + Poor Metadata Support)
+
+- MP3 (Lossy)
+
+- WMA (Lossy)
 
 ## 🛑 Bypassed Files (Exclusions)
 The script leaves files untouched in the source directory if:
-1. `"dry_run": true` is active.
-2. The file format is unsupported (e.g., `.ogg`, `.jpg`).
-3. The database (in-memory cache) marks the file as already processed.
-4. The file is 0 bytes or locked by the OS.
-5. Audio headers are entirely unreadable by `mutagen`.
-6. You manually select `0 (Skip)` or `Q (Quit)` during ambiguity resolution.
+
+- "dry_run": true is active.
+
+- The file format is unsupported (e.g., .ogg, .jpg).
+
+- The database (in-memory cache) marks the file as already processed.
+
+- The file is 0 bytes or locked by the OS.
+
+- Audio headers are entirely unreadable by mutagen.
+
+- You manually select 0 (Skip) or Q (Quit) during ambiguity resolution.

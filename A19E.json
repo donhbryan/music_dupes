@@ -1,0 +1,14 @@
+{
+    "api_key": "7dlZplmc3N",
+    "music_folder": "/mnt/NAS/cleanmusic/NewMaster/",
+    "destination_folder": "/mnt/NAS/cleanmusic/temp/NewMaster/",
+    "dup_folder": "/mnt/NAS/cleanmusic/temp//duplicates/",
+    "unresolved_folder": "/mnt/NAS/cleanmusic/temp/unresolved/",
+    "db_path": "library_manager19e.db",
+    "dry_run": false,
+    "prune": false,
+    "hashAudio": false,
+    "rebuild_db": false,
+    "global_dedup": false,
+    "process": true  
+}
