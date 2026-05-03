@@ -898,7 +898,8 @@ if __name__ == "__main__":
         sys.exit(0)
 
     manager = MusicLibraryManager(config_file=config_filename)
-    logging.info(f"Starting Config:  Music Source: {manager.music_folder}\n" 
+    logging.info(f"\n\n\nStarting Config: *******************************************\n" 
+                 f"Music Source: {manager.music_folder}\n" 
                  f" Music Target: {manager.destination_folder}\n" 
                  f" Duplicates Folder: {manager.dup_folder}\n" 
                  f" Unresolved Folder: {manager.unresolved_folder}\n" 
