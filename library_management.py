@@ -1,3 +1,9 @@
+'''
+Library Management System for Music Collections
+Version: 19E 
+Date: June 17 2026
+'''
+
 import os
 import sys
 import time
@@ -53,6 +59,7 @@ class MusicLibraryManager:
         self.dry_run = parse_bool(config.get("dry_run", False))
         self.prune = parse_bool(config.get("prune", False))
         self.hash_audio = parse_bool(config.get("hashAudio", False))
+        self.rebuild_db = parse_bool(config.get("rebuild_db", False))
         self.run_process = parse_bool(config.get("process", True))
         self.global_dedup = parse_bool(config.get("global_dedup", False))
 
@@ -75,6 +82,9 @@ class MusicLibraryManager:
         self.known_hashes = {}
         self.library_state = collections.defaultdict(list) # acoustid -> [{path, album_id, score}]
         self.known_acoustids = set() # For fast fingerprint caching logic
+        
+        # RAM Cache for Directory-Level Album Data (MBID -> Album Data)
+        self.rebuild_album_cache = {} 
 
         logging.basicConfig(
             filename="library_manager.log", level=logging.INFO,
@@ -106,11 +116,22 @@ class MusicLibraryManager:
         try: self.cur.execute("ALTER TABLE files ADD COLUMN date_modified DATETIME DEFAULT CURRENT_TIMESTAMP")
         except sqlite3.OperationalError: pass
 
+        # Database Modifications for Authoritative MusicBrainz Integration
+        new_album_columns = ["mb_release_id TEXT", "mb_artist_id TEXT"]
+        for col in new_album_columns:
+            try: self.cur.execute(f"ALTER TABLE albums ADD COLUMN {col}")
+            except sqlite3.OperationalError: pass
+
+        new_file_columns = ["mb_recording_id TEXT", "mb_track_id TEXT"]
+        for col in new_file_columns:
+            try: self.cur.execute(f"ALTER TABLE files ADD COLUMN {col}")
+            except sqlite3.OperationalError: pass
+
         self.cur.execute("""CREATE TRIGGER IF NOT EXISTS update_files_modtime AFTER UPDATE ON files FOR EACH ROW BEGIN UPDATE files SET date_modified = CURRENT_TIMESTAMP WHERE path = old.path; END;""")
         self.cur.execute("""CREATE TABLE IF NOT EXISTS known_fingerprints (fingerprint TEXT, acoustid_id TEXT, PRIMARY KEY (fingerprint, acoustid_id))""")
-        self.cur.execute("""CREATE TABLE IF NOT EXISTS known_blocks (block TEXT, acoustid_id TEXT)""")
-        self.cur.execute("""CREATE TABLE IF NOT EXISTS fingerprint_index (block TEXT, path TEXT, FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE)""")
-        self.cur.execute("""CREATE TABLE IF NOT EXISTS audio_hashes (audio_hash TEXT PRIMARY KEY, path TEXT)""")
+        self.cur.execute("""CREATE TABLE IF NOT EXISTS known_blocks (block TEXT, acoustid_id TEXT, UNIQUE(block, acoustid_id))""")
+        self.cur.execute("""CREATE TABLE IF NOT EXISTS fingerprint_index (block TEXT, path TEXT, FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE ON UPDATE CASCADE)""")
+        self.cur.execute("""CREATE TABLE IF NOT EXISTS audio_hashes (audio_hash TEXT PRIMARY KEY, path TEXT, FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE ON UPDATE CASCADE)""")
         self.cur.execute("""CREATE TABLE IF NOT EXISTS ambiguous_files (path TEXT PRIMARY KEY, candidates_json TEXT, acoustid_id TEXT, fingerprint TEXT, quality_json TEXT, audio_hash TEXT)""")
 
         self.cur.execute("CREATE INDEX IF NOT EXISTS idx_acoustid ON files(acoustid_id)")
@@ -168,6 +189,165 @@ class MusicLibraryManager:
             self.known_acoustids.add(aid)
 
         print(f"Loaded {len(self.processed_files)} processed files, {len(self.known_hashes)} hashes, and {len(self.known_acoustids)} AcousticIDs.")
+
+    def _extract_existing_tags(self, path):
+        """Reads audio tags to find existing AcoustID and MusicBrainz metadata."""
+        tags = {
+            "acoustid_id": None, "mb_release_id": None, 
+            "mb_artist_id": None, "mb_recording_id": None,
+            "title": "Unknown", "artist": "Unknown", 
+            "album": "Unknown Album", "track_no": 1, "disc_no": 1
+        }
+        try:
+            audio = mutagen.File(path)
+            if not audio: return tags
+
+            ext = path.lower()
+            if ext.endswith('.mp3'):
+                for key in audio.keys():
+                    if key.startswith('TXXX:Acoustid Id'): tags['acoustid_id'] = audio[key].text[0]
+                    elif key.startswith('TXXX:MusicBrainz Album Id'): tags['mb_release_id'] = audio[key].text[0]
+                    elif key.startswith('TXXX:MusicBrainz Artist Id'): tags['mb_artist_id'] = audio[key].text[0]
+                    elif key.startswith('UFID:http://musicbrainz.org'): tags['mb_recording_id'] = audio[key].data.decode('utf-8', errors='ignore')
+                
+                tags['title'] = str(audio.get('TIT2', tags['title']))
+                tags['artist'] = str(audio.get('TPE1', tags['artist']))
+                tags['album'] = str(audio.get('TALB', tags['album']))
+
+            elif ext.endswith(('.flac', '.ogg', '.m4a', '.mp4')):
+                if 'acoustid_id' in audio: tags['acoustid_id'] = audio['acoustid_id'][0]
+                if 'musicbrainz_albumid' in audio: tags['mb_release_id'] = audio['musicbrainz_albumid'][0]
+                if 'musicbrainz_artistid' in audio: tags['mb_artist_id'] = audio['musicbrainz_artistid'][0]
+                if 'musicbrainz_trackid' in audio: tags['mb_recording_id'] = audio['musicbrainz_trackid'][0]
+                
+                if ext.endswith(('.flac', '.ogg')):
+                    tags['title'] = audio.get('title', [tags['title']])[0]
+                    tags['artist'] = audio.get('artist', [tags['artist']])[0]
+                    tags['album'] = audio.get('album', [tags['album']])[0]
+                else:
+                    tags['title'] = audio.get('\xa9nam', [tags['title']])[0]
+                    tags['artist'] = audio.get('\xa9ART', [tags['artist']])[0]
+                    tags['album'] = audio.get('\xa9alb', [tags['album']])[0]
+                    
+        except Exception as e:
+            logging.error(f"Tag extraction error on {path}: {e}")
+        return tags
+
+    def rebuild_database(self):
+        """Rebuilds the database natively using the existing directory hierarchy."""
+        if not os.path.exists(self.music_folder):
+            print(f"Error: Music source directory {self.music_folder} does not exist.")
+            return
+
+        print(f"\n--- Starting Database Rebuild from Directory Structure ---")
+        files_to_process = [os.path.join(r, f) for r, _, fs in os.walk(self.music_folder) for f in fs if f.lower().endswith((".mp3", ".flac", ".m4a", ".mp4", ".wma", ".wav"))]
+        
+        print(f"Found {len(files_to_process)} supported files. Rebuilding metadata and strict MB links...")
+
+        io_threads = min(8, (os.cpu_count() or 1) + 2) 
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=io_threads) as executor:
+            futures = []
+            for path in files_to_process:
+                futures.append(executor.submit(self._rebuild_single_file_worker, path))
+
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Rebuilding Database"):
+                try: future.result()
+                except Exception as e: logging.error(f"Rebuild Thread Error: {e}")
+
+        self.db_queue.put(("COMMIT", None, None))
+        self.db_queue.join() 
+        print("Database rebuild complete. MusicBrainz data natively synced.")
+
+    def _rebuild_single_file_worker(self, path):
+        """Worker function for the maintenance rebuild process."""
+        try:
+            if os.path.getsize(path) == 0: return
+        except OSError: return
+
+        quality = self._calculate_quality(path)
+        if not quality: return
+
+        duration, fingerprint = self._get_fingerprint(path)
+        tags = self._extract_existing_tags(path)
+        
+        acoustid_id = tags.get('acoustid_id')
+        mb_release_id = tags.get('mb_release_id')
+        mb_artist_id = tags.get('mb_artist_id')
+        mb_recording_id = tags.get('mb_recording_id')
+
+        # Fallback 1: AcoustID Lookup to backfill MB tags
+        if fingerprint and not (acoustid_id and mb_release_id and mb_recording_id):
+            try:
+                with self.acoustid_api_lock:
+                    now = time.time()
+                    elapsed = now - self.last_acoustid_call
+                    wait_time = max(0, 0.35 - elapsed)
+                    self.last_acoustid_call = now + wait_time
+                if wait_time > 0: time.sleep(wait_time)
+                
+                resp = acoustid.lookup(self.api_key, fingerprint, duration, meta="recordings releases")
+                if resp.get("status") == "ok" and resp.get("results"):
+                    top_result = resp["results"][0]
+                    acoustid_id = acoustid_id or top_result.get("id")
+                    if not mb_recording_id and top_result.get("recordings"):
+                        mb_recording_id = top_result["recordings"][0].get("id")
+                    if not mb_release_id and top_result.get("recordings"):
+                        for rec in top_result["recordings"]:
+                            if rec.get("releases"):
+                                mb_release_id = rec["releases"][0].get("id")
+                                break
+            except Exception as e:
+                logging.warning(f"AcoustID Rebuild fallback failed for {path}: {e}")
+
+        # Fallback 2: MusicBrainz Search
+        if not (mb_release_id and mb_recording_id) and tags['title'] != 'Unknown':
+            try:
+                with self.mb_api_lock:
+                    now = time.time()
+                    elapsed = now - self.last_mb_call
+                    wait_time = max(0, 1.0 - elapsed)
+                    self.last_mb_call = now + wait_time
+                if wait_time > 0: time.sleep(wait_time)
+                
+                query = f'recording:"{tags["title"]}" artist:"{tags["artist"]}"'
+                musicbrainzngs.set_timeout(10)
+                result = musicbrainzngs.search_recordings(query=query, limit=1)
+                
+                if result.get("recording-list"):
+                    rec = result["recording-list"][0]
+                    mb_recording_id = mb_recording_id or rec.get("id")
+                    if rec.get("release-list"):
+                        mb_release_id = mb_release_id or rec["release-list"][0].get("id")
+            except Exception as e:
+                logging.warning(f"MB Rebuild fallback failed for {path}: {e}")
+
+        # Assume directories define the definitive hierarchy based on folder paths
+        # Structure: .../Artist/Album/Songs.ext
+        path_parts = path.split(os.sep)
+        if len(path_parts) >= 3:
+            inferred_album = path_parts[-2]
+            inferred_artist = path_parts[-3]
+        else:
+            inferred_album, inferred_artist = tags['album'], tags['artist']
+
+        # Enforce defaults if APIs failed entirely
+        mb_release_id = mb_release_id or "UNKNOWN_RELEASE"
+        mb_recording_id = mb_recording_id or "UNKNOWN_RECORDING"
+        acoustid_id = acoustid_id or "UNKNOWN_ACOUSTID"
+
+        # Queue Database Writes for the extended schema
+        self.db_queue.put(("EXECUTE", "INSERT OR IGNORE INTO albums (release_id, album_title, album_artist, mb_release_id, mb_artist_id) VALUES (?,?,?,?,?)", 
+                          (mb_release_id, inferred_album, inferred_artist, mb_release_id, mb_artist_id)))
+        
+        self.db_queue.put(("EXECUTE", """INSERT OR REPLACE INTO files (path, fingerprint, acoustid_id, title, track_no, disc_no, format, file_size, quality_score, album_id, processed, date_modified, mb_recording_id) 
+                          VALUES (?,?,?,?,?,?,?,?,?,?,?, CURRENT_TIMESTAMP, ?)""", 
+                          (path, fingerprint, acoustid_id, tags['title'], tags['track_no'], tags['disc_no'], quality["format"], quality["size"], quality["score"], mb_release_id, 1, mb_recording_id)))
+        
+        if fingerprint:
+            blocks = [(b, path) for b in self._get_blocks(fingerprint)]
+            self.db_queue.put(("EXECUTEMANY", "INSERT INTO fingerprint_index (block, path) VALUES (?, ?)", blocks))
+
 
     def prune_database(self):
         if not os.path.exists(self.music_folder): return
@@ -234,10 +414,10 @@ class MusicLibraryManager:
         self.known_acoustids.add(acoustid_id)
         self.db_queue.put(("EXECUTE", "INSERT OR IGNORE INTO known_fingerprints (fingerprint, acoustid_id) VALUES (?, ?)", (fingerprint, acoustid_id)))
         blocks = [(b, acoustid_id) for b in self._get_blocks(fingerprint)]
-        self.db_queue.put(("EXECUTEMANY", "INSERT INTO known_blocks (block, acoustid_id) VALUES (?, ?)", blocks))
-
+        # Changed to INSERT OR IGNORE to respect the new UNIQUE constraint
+        self.db_queue.put(("EXECUTEMANY", "INSERT OR IGNORE INTO known_blocks (block, acoustid_id) VALUES (?, ?)", blocks))
+        
     def _get_owned_release_ids(self, acoustid_id):
-        # Read from RAM instead of SQL
         return set(rec["album_id"] for rec in self.library_state.get(acoustid_id, []) if rec["album_id"])
 
     def _calculate_quality(self, file_path):
@@ -352,7 +532,7 @@ class MusicLibraryManager:
 
     def _prompt_user_selection(self, file_path, candidates):
         filename = os.path.basename(file_path)
-        page_size = 10
+        page_size = 20
         current_page = 0
         total_pages = (len(candidates) + page_size - 1) // page_size
         self._play_audio(file_path)
@@ -374,13 +554,13 @@ class MusicLibraryManager:
                     own_mark = "*" if c.get("is_owned") else ""
                     print(f"{global_idx:<3} {own_mark:<3} {sim_pct:<5} {c['country']:<4} {c['date']:<6} {c['artist'][:25]:<25} {c['album_title']}")
 
-                prompt_str = f"Select Album # (1-{len(candidates)}, comma-separated), (N)ext, (P)rev, (R)eplay, (0) Skip, (Q)uit"
+                prompt_str = f"Select Album # (1-{len(candidates)}, comma-separated), (+)Next, (P)rev, (R)eplay, (0) Skip, (Q)uit"
                 choice = input(f"{prompt_str}: ").lower().strip()
 
                 if choice == "0": return []
                 elif choice == "q": return "quit"
                 elif choice == "r": self._play_audio(file_path); continue
-                elif choice == "n" and current_page < total_pages - 1: current_page += 1
+                elif choice == "+" and current_page < total_pages - 1: current_page += 1
                 elif choice == "p" and current_page > 0: current_page -= 1
                 else:
                     try:
@@ -437,7 +617,6 @@ class MusicLibraryManager:
                 except OSError: pass
 
     def _handle_album_deduplication(self, path, acoustid_id, release_id, quality, dispose_source=False):
-        # RAM Check instead of SQLite Check
         existing_records = self.library_state.get(acoustid_id, [])
         existing = None
 
@@ -457,23 +636,15 @@ class MusicLibraryManager:
             print(f" -> Upgrading existing file (Quality: {existing_score} -> {quality['score']})")
             if not self.dry_run:
                 self._safe_move(existing_path, self.dup_folder, operation="move")
-                
-                # Update RAM
                 self.processed_files.discard(existing_path)
                 existing_records.remove(existing)
-                
-                # Queue DB action
                 self.db_queue.put(("EXECUTE", "DELETE FROM files WHERE path = ?", (existing_path,)))
             return True
         else:
             print(f" -> Duplicate found (lower/equal quality). Moving to duplicates.")
             if dispose_source and not self.dry_run:
                 self._safe_move(path, self.dup_folder, operation="move")
-                
-                # Update RAM
                 self.processed_files.add(path)
-                
-                # Queue DB action
                 self.db_queue.put(("EXECUTE", """INSERT OR REPLACE INTO files (path, processed, acoustid_id, quality_score, format, file_size, date_modified) VALUES (?, 1, ?, ?, ?, ?, CURRENT_TIMESTAMP)""", (path, acoustid_id, quality["score"], quality["format"], quality["size"])))
             return False
 
@@ -551,8 +722,6 @@ class MusicLibraryManager:
         quality = self._calculate_quality(path)
         if not quality: return
 
-        # Defer FFMPEG Hashing UNLESS AcoustID says we need to (Performance Optimization)
-        # However, for pure exact match skips, we still check existing hashes if available
         audio_hash = None
         duration, fingerprint = self._get_fingerprint(path)
         
@@ -569,7 +738,12 @@ class MusicLibraryManager:
                 
             if wait_time > 0: time.sleep(wait_time)
                 
-            resp = acoustid.lookup(self.api_key, fingerprint, duration, meta="recordings releases tracks")
+            # Catch bad API responses (HTML instead of JSON)
+            try:
+                resp = acoustid.lookup(self.api_key, fingerprint, duration, meta="recordings releases tracks")
+            except Exception as api_err:
+                logging.warning(f"AcoustID API failed on {path} (Server Error): {api_err}")
+                resp = {} # Proceed to MusicBrainz fallback
 
             candidates = []
             if resp.get("status") == "ok" and resp.get("results"): candidates = self._get_candidates(resp["results"])
@@ -603,13 +777,11 @@ class MusicLibraryManager:
                     selected_matches = [top_match]
                     self.last_selected_album_id = top_match["release"]["id"]
                 else:
-                    # Calculate heavy hash only when ambiguous to help Phase 2
                     audio_hash = self._get_audio_hash(path)
                     self._save_ambiguous_to_db(path, candidates, current_acoustid_id, fingerprint, quality, audio_hash)
                     return
 
             if selected_matches:
-                # Calculate heavy hash right before confirming an update
                 audio_hash = self._get_audio_hash(path)
                 for idx, match in enumerate(selected_matches):
                     self._process_match_for_file(path, current_acoustid_id, fingerprint, quality, audio_hash, match, idx == len(selected_matches) - 1)
@@ -622,7 +794,6 @@ class MusicLibraryManager:
 
     # --- PHASE 2: Interactive Disambiguation ---
     def resolve_ambiguous_files(self):
-        # Read directly via main thread connection, queue was flushed above
         self.cur.execute("SELECT path, candidates_json, acoustid_id, fingerprint, quality_json, audio_hash FROM ambiguous_files")
         rows = self.cur.fetchall()
 
@@ -669,7 +840,6 @@ class MusicLibraryManager:
             if not self.dry_run:
                 self.db_queue.put(("EXECUTE", "DELETE FROM ambiguous_files WHERE path = ?", (path,)))
 
-        # Final flush
         self.db_queue.put(("COMMIT", None, None))
         self.db_queue.join()
 
@@ -710,13 +880,11 @@ class MusicLibraryManager:
 
         self._apply_tags(final_path, meta)
 
-        # UPDATE RAM Caches Instantly
         self.processed_files.add(final_path)
         if audio_hash: self.known_hashes[audio_hash] = {"path": final_path, "score": quality["score"]}
         self.library_state[current_acoustid_id].append({"path": final_path, "album_id": meta["release_id"], "score": quality["score"]})
 
-        # QUEUE Database Writes
-        self.db_queue.put(("EXECUTE", "INSERT OR IGNORE INTO albums VALUES (?,?,?,?,?)", (meta["release_id"], meta["album"], meta["album_artist"], meta["release_date"], rel.get("country", "XX"))))
+        self.db_queue.put(("EXECUTE", "INSERT OR IGNORE INTO albums (release_id, album_title, album_artist, release_date, country) VALUES (?,?,?,?,?)", (meta["release_id"], meta["album"], meta["album_artist"], meta["release_date"], rel.get("country", "XX"))))
         self.db_queue.put(("EXECUTE", """INSERT OR REPLACE INTO files (path, fingerprint, acoustid_id, title, track_no, disc_no, format, file_size, quality_score, album_id, processed, date_modified) VALUES (?,?,?,?,?,?,?,?,?,?,?, CURRENT_TIMESTAMP)""", (final_path, fingerprint, current_acoustid_id, meta["title"], meta["track_no"], meta["disc_no"], quality["format"], quality["size"], quality["score"], meta["release_id"], 1)))
         
         self.db_queue.put(("EXECUTE", "DELETE FROM fingerprint_index WHERE path = ?", (final_path,)))
@@ -731,15 +899,29 @@ class MusicLibraryManager:
     def __del__(self): self.close()
 
 if __name__ == "__main__":
-    config_filename = "A18b.json"
+    config_filename = "library_management_config.json"
     if not os.path.exists(config_filename):
-        with open(config_filename, "w") as f: json.dump({"api_key": "7dlZplmc3N", "music_folder": "/mnt/NAS/cleanmusic/music2/", "destination_folder": "/mnt/NAS/cleanmusic/NewMaster/", "dup_folder": "/mnt/NAS/cleanmusic/duplicates/", "unresolved_folder": "/mnt/NAS/cleanmusic/unresolved/", "db_path": "library_manager.db", "dry_run": False, "prune": False, "hashAudio": False, "global_dedup": False, "process": True}, f, indent=4)
+        with open(config_filename, "w") as f: json.dump({"api_key": "7dlZplmc3N", "music_folder": "/mnt/NAS/cleanmusic/music/", "destination_folder": "/mnt/NAS/cleanmusic/NewMaster/", "dup_folder": "/mnt/NAS/cleanmusic/duplicates/", "unresolved_folder": "/mnt/NAS/cleanmusic/unresolved/", "db_path": "library_manager.db", "dry_run": False, "prune": False, "hashAudio": False, "rebuild_db": False, "global_dedup": False, "process": True}, f, indent=4)
         sys.exit(0)
 
     manager = MusicLibraryManager(config_file=config_filename)
+    logging.info(f"\n\n\nStarting Config: *******************************************\n" 
+                 f"Music Source: {manager.music_folder}\n" 
+                 f" Music Target: {manager.destination_folder}\n" 
+                 f" Duplicates Folder: {manager.dup_folder}\n" 
+                 f" Unresolved Folder: {manager.unresolved_folder}\n" 
+                 f" Database: {manager.db_path}\n" 
+                 f" Dry Run: {manager.dry_run}\n" 
+                 f" Prune DB: {manager.prune}\n" 
+                 f" Hash Audio: {manager.hash_audio}\n" 
+                 f" Rebuild DB: {manager.rebuild_db}\n" 
+                 f" Global Deduplication: {manager.global_dedup}\n" 
+                 f" Process Library: {manager.run_process}")
+                
     if manager.dry_run: print("\n[!] DRY RUN MODE ACTIVATED [!]\n")
     try:
         if manager.prune: manager.prune_database()
+        if manager.rebuild_db: manager.rebuild_database()
         if manager.hash_audio: manager.hash_existing_audio()
         if manager.run_process: manager.process_library()
     except KeyboardInterrupt: print("\nProcess interrupted by user. Shutting down gracefully...")

@@ -6,7 +6,7 @@ from pathlib import Path
 from mutagen.flac import FLAC, FLACNoHeaderError
 
 
-def load_config(config_file="config.ini"):
+def load_config(config_file="fix_bad_files_config.ini"):
     """Loads the source and target directories from the config file."""
     config = configparser.ConfigParser()
 

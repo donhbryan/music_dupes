@@ -1,0 +1,40 @@
+
+=============================================================
+
+A. Core Identity & Objectives
+Project: Audio Library Deduplication & Management Tool
+
+Objective: Process, deduplicate, and organize an archive of 50,000+ audio files. The system must utilize acoustic fingerprinting and audio quality metrics to determine the optimal file versions to keep.
+
+Performance Goal: Maximum execution speed and minimum processing delay via efficient multithreading.
+
+Tech Stack: Python 3.x, SQLite, Mutagen, AcoustID.
+
+B. Architecture & Module Map
+(Note: Update these filenames to match your actual local structure)
+
+main.py: Application entry point; orchestrates the multithreaded detection script and manages the thread pool.
+
+fingerprint.py: Handles audio fingerprint generation and API calls via AcoustID.
+
+metadata.py: Reads, parses, and updates audio file tags using Mutagen.
+
+database.py: Manages the SQLite connection, schema initialization, and CRUD operations.
+
+dedupe_logic.py: Contains the core logic for evaluating quality metrics and fingerprint matches to isolate duplicates.
+
+C. Immutable Constraints & Rules
+Rule 1: Thread Safety: All SQLite database writes must be strictly thread-safe. Use a robust connection pooling method or a dedicated queue to prevent locking errors during high-speed concurrent processing.
+
+Rule 2: Safe Deletion: Do not implement automatic, permanent deletion of duplicate files. Duplicates must be flagged in the database or moved to a quarantine directory for final review.
+
+Rule 3: AI Code Modifications: When assisting with this project, generate or modify only the specific function, class, or method requested. Never output a full file rewrite unless explicitly commanded.
+
+Rule 4: Documentation: All new functions must include standard Python type hints and concise docstrings.
+
+D. Current State & Next Steps (The Changelog)
+Working: [e.g., SQLite schema initialized, basic directory traversal]
+
+Currently Implementing: [e.g., Multithreaded integration of the Mutagen parser]
+
+Known Issues: [e.g., Thread collisions during heavy concurrent database inserts, AcoustID API rate limiting]

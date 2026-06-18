@@ -1,0 +1,16 @@
+**version 19e**
+added commit notes
+added manifest.md - prompt gaurdrails
+added library_management.db.sql - schema definition
+added youtubedl.py download youtube audio
+renamed A19e_library_management.py file to library_management.py
+renamed A19e.json to library_management_config.json
+renamed fix_bad_files_config.json
+renamed cleanup_empty_folders.py
+
+
+deleted old versions of AXXl_library_management.py
+deleted old databases
+deleted test_manager.db
+deleted test.py
+

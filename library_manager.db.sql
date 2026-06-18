@@ -1,0 +1,16 @@
+BEGIN TRANSACTION;
+CREATE TABLE IF NOT EXISTS albums (release_id TEXT PRIMARY KEY, album_title TEXT, album_artist TEXT, release_date TEXT, country TEXT, mb_release_id TEXT, mb_artist_id TEXT);
+CREATE TABLE IF NOT EXISTS ambiguous_files (path TEXT PRIMARY KEY, candidates_json TEXT, acoustid_id TEXT, fingerprint TEXT, quality_json TEXT, audio_hash TEXT);
+CREATE TABLE IF NOT EXISTS audio_hashes (audio_hash TEXT PRIMARY KEY, path TEXT, FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE ON UPDATE CASCADE);
+CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, fingerprint TEXT, acoustid_id TEXT, title TEXT, track_no INTEGER, disc_no INTEGER, format TEXT, file_size INTEGER, quality_score REAL, album_id TEXT, processed INTEGER DEFAULT 0, date_modified DATETIME DEFAULT CURRENT_TIMESTAMP, mb_recording_id TEXT, mb_track_id TEXT, FOREIGN KEY (album_id) REFERENCES albums (release_id));
+CREATE TABLE IF NOT EXISTS fingerprint_index (block TEXT, path TEXT, FOREIGN KEY(path) REFERENCES files(path) ON DELETE CASCADE ON UPDATE CASCADE);
+CREATE TABLE IF NOT EXISTS known_blocks (block TEXT, acoustid_id TEXT);
+CREATE TABLE IF NOT EXISTS known_fingerprints (fingerprint TEXT, acoustid_id TEXT, PRIMARY KEY (fingerprint, acoustid_id));
+CREATE INDEX idx_acoustid ON files(acoustid_id);
+CREATE INDEX idx_audio_hashes_path ON audio_hashes(path);
+CREATE INDEX idx_file_blocks ON fingerprint_index(block);
+CREATE INDEX idx_files_dedup ON files(acoustid_id, album_id, processed);
+CREATE INDEX idx_files_processed ON files(processed);
+CREATE INDEX idx_known_blocks ON known_blocks(block);
+CREATE TRIGGER update_files_modtime AFTER UPDATE ON files FOR EACH ROW BEGIN UPDATE files SET date_modified = CURRENT_TIMESTAMP WHERE path = old.path; END;
+COMMIT;
